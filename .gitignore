@@ -1,0 +1,53 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.coverage
+htmlcov/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.DS_Store
+
+# Local configuration and editor state
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+
+# Research and design notes remain local.
+*.md
+
+# Virtual environments
+.venv/
+
+# This repository publishes TabPVN only. The sibling projects and archived
+# training work remain local to the research workspace.
+/certifiedlm/
+/deploy/
+/external/
+/model/
+/RESEARCH_PLAN.md
+/scripts/*
+!/scripts/release_check.sh
+/tools/*
+!/tools/verify_runtime_artifact.py
+/tabpvn/experiments/
+/tabpvn/fol_regression.py
+/benchmark/eval_real.py
+
+# Downloaded datasets and generated benchmark output
+/data/
+/results/
+
+# Generated model artifacts
+*.ckpt
+*.joblib
+*.pkl
+*.pt
+*.pth
+*.tabpvn
