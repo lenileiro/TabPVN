@@ -1,0 +1,171 @@
+[project]
+name = "tabpvn"
+dynamic = ["version"]
+description = "Deterministic, proof-carrying tabular classification and regression."
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "numba>=0.61",
+    "numpy>=1.26",
+    "pandas>=2.1",
+    "scipy>=1.11",
+    "scikit-learn>=1.4",
+]
+
+# Heavy / optional model backends. Install per-machine (esp. the cluster).
+#   uv sync --extra gbdt          # gradient-boosted trees
+#   uv sync --extra pfn           # TabPFN (pulls torch)
+#   uv sync --extra openml        # real OpenML datasets
+#   uv sync --all-extras
+[project.optional-dependencies]
+gbdt = [
+    "xgboost>=2.0",
+    "lightgbm>=4.1",
+    "catboost>=1.2",
+]
+pfn = [
+    "tabpfn>=8,<9",  # local PyTorch package; loads TabPFN-3 weights offline (Prior-Labs/tabpfn_3, public on HF)
+]
+openml = [
+    "openml>=0.14",
+]
+kaggle = [
+    "kaggle>=1.6",
+]
+torch = [
+    "torch>=2.2",
+]
+attest = [
+    "cryptography>=42",
+]
+benchmark = [
+    "huggingface-hub>=0.30",
+    "openml>=0.14",
+    "kaggle>=1.6",
+    "pyarrow>=17",
+]
+dev = [
+    "mypy>=1.10",
+    "pytest>=7",
+    "ruff>=0.5",
+    "vulture>=2.11",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tabpvn/tests"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "tabpvn/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["core", "tabpvn"]
+exclude = [
+    "tabpvn/*.md",
+    "tabpvn/experiments/**",
+    "tabpvn/tests/**",
+    "tabpvn/fol_regression.py",
+]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "core/**",
+    "tabpvn/**",
+    "pyproject.toml",
+]
+exclude = [
+    "tabpvn/*.md",
+    "tabpvn/experiments/**",
+    "tabpvn/tests/**",
+    "tabpvn/fol_regression.py",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+extend-exclude = [
+    "tabpvn/experiments",
+    "tabpvn/fol_regression.py",
+]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP", "B", "C901", "PIE", "RUF100"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 20
+
+[tool.ruff.format]
+docstring-code-format = true
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.11"
+files = [
+    "core/fol_kg_induction.py",
+    "core/kernel_fol.py",
+    "tabpvn/adapters.py",
+    "tabpvn/__init__.py",
+    "tabpvn/attention.py",
+    "tabpvn/api.py",
+    "tabpvn/attestations.py",
+    "tabpvn/bayes.py",
+    "tabpvn/certified_confidence.py",
+    "tabpvn/compression_evidence.py",
+    "tabpvn/model_io.py",
+    "tabpvn/operating_points.py",
+    "tabpvn/pipeline.py",
+    "tabpvn/predicate_compiler.py",
+    "tabpvn/preprocessing.py",
+    "tabpvn/pricing.py",
+    "tabpvn/proofs.py",
+    "tabpvn/proposers/affine.py",
+    "tabpvn/proposers/base.py",
+    "tabpvn/proposers/evidence.py",
+    "tabpvn/proposers/temporal.py",
+    "tabpvn/region_algebra.py",
+    "tabpvn/relational.py",
+    "tabpvn/residual_dynamics.py",
+    "tabpvn/temporal.py",
+    "tabpvn/validation.py",
+]
+check_untyped_defs = true
+follow_imports = "skip"
+ignore_missing_imports = true
+no_implicit_optional = true
+pretty = true
+show_error_codes = true
+warn_redundant_casts = true
+warn_unused_configs = true
+warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+module = [
+    "core.fol_kg_induction",
+    "core.kernel_fol",
+    "tabpvn.adapters",
+    "tabpvn",
+    "tabpvn.attention",
+    "tabpvn.api",
+    "tabpvn.attestations",
+    "tabpvn.bayes",
+    "tabpvn.certified_confidence",
+    "tabpvn.compression_evidence",
+    "tabpvn.model_io",
+    "tabpvn.operating_points",
+    "tabpvn.pipeline",
+    "tabpvn.preprocessing",
+    "tabpvn.pricing",
+    "tabpvn.proofs",
+    "tabpvn.proposers.affine",
+    "tabpvn.proposers.base",
+    "tabpvn.proposers.evidence",
+    "tabpvn.proposers.temporal",
+    "tabpvn.relational",
+    "tabpvn.residual_dynamics",
+    "tabpvn.temporal",
+    "tabpvn.validation",
+]
+disallow_incomplete_defs = true
+disallow_untyped_defs = true
