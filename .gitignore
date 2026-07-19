@@ -21,6 +21,7 @@ htmlcov/
 
 # Research and design notes remain local.
 *.md
+!/README.md
 
 # Virtual environments
 .venv/
