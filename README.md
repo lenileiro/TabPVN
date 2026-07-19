@@ -60,67 +60,240 @@ deployment boundary.
 
 ## Proof-Carrying Reply
 
-A normal regressor returns a number. TabPVN can return the number, a validated
-error bound, replayable conditions, and a stable machine-readable proof response.
-This deterministic synthetic delivery-duration example uses the automatic
-default architecture:
+A normal regressor returns a number. TabPVN returns the number together with a
+validated error bound, replayable conditions, and a machine-checkable audit
+binding.
+
+This example uses the real
+[UCI/NASA Airfoil Self-Noise dataset](https://archive.ics.uci.edu/dataset/291/airfoil%2Bself%2Bnoise),
+whose target is scaled sound pressure in decibels. It uses official TabArena
+fold 0 and the automatic `TabPVN()` defaults, with no dataset-specific tuning.
+
+| Official fold-0 result | Value |
+| --- | ---: |
+| Training / held-out rows | 1,002 / 501 |
+| TabPVN RMSE | **1.2879 dB** |
+| Histogram GBDT RMSE | 1.5462 dB |
+| Relative RMSE reduction | **16.7%** |
+
+The following held-out row was selected for a compact proof with readable
+physical conditions. It is an illustrative response, not the aggregate result
+above. Reproducing it requires the `openml` optional dependency:
 
 ```python
-import numpy as np
-import pandas as pd
-
+from benchmark.datasets import tabarena_suite
 from tabpvn import TabPVN
 
-rng = np.random.default_rng(3)
-distance_km = np.linspace(0.0, 10.0, 240)
-delivery_minutes = np.where(distance_km <= 5.0, 12.0, 28.0)
-delivery_minutes += rng.normal(0.0, 0.2, 240)
+dataset = tabarena_suite(dataset_names=["airfoil_self_noise"])[0]
+train_indices, test_indices = dataset.splits[0]
 
-X = pd.DataFrame({"distance_km": distance_km})
-model = TabPVN(task="regression").fit(X, delivery_minutes)
-row = pd.DataFrame({"distance_km": [7.5]})
+model = TabPVN(task="regression").fit(
+    dataset.X.iloc[train_indices],
+    dataset.y[train_indices],
+)
+held_out_row = 355
+row = dataset.X.iloc[[test_indices[held_out_row]]]
 ```
 
 Input:
 
 ```json
 {
-  "distance_km": 7.5
+  "frequency": 4000,
+  "attack-angle": "15.4",
+  "chord-length": 0.0508,
+  "free-stream-velocity": 55.5,
+  "suction-side-displacement-thickness": 0.0271925
 }
 ```
 
-`predict()` returned `28.0401` minutes. The current public `proof()` API returned
-this complete response:
+The public reply predicts **119.943 dB** and returns a validated interval of
+**[117.634, 122.252] dB**. Its first replayable reason requires all of these
+observed conditions:
+
+| Feature | Verified condition | Observed |
+| --- | ---: | ---: |
+| Frequency | `2500 < x <= 5000` | 4000 Hz |
+| Displacement thickness | `x > 0.00592927` | 0.0271925 m |
+| Chord length | `x > 0.0254` | 0.0508 m |
+| Free-stream velocity | `x > 39.6` | 55.5 m/s |
+
+The target was not supplied when the reply was built. Afterward, the held-out
+target was revealed as **120.920 dB**, an absolute error of **0.977 dB**, inside
+the declared interval.
+
+<details>
+<summary>Complete public <code>tabpvn.proof/3</code> response</summary>
 
 ```json
 {
   "schema": "tabpvn.proof/3",
-  "summary": "Prediction: 28.0401. Decision verification passed. Validated error bound: +/- 0.388151. No observed target was supplied.",
+  "summary": "Prediction: 119.943. Decision verification passed. Validated error bound: +/- 2.30923. No observed target was supplied.",
   "prediction": {
     "task": "regression",
-    "value": 28.040068597244957
+    "value": 119.94294784614738
   },
   "reliability": {
     "status": "verified",
     "type": "error_bound",
-    "value": 0.388151374841712,
+    "value": 2.3092268354244765,
     "applies_to": "validated_population",
     "interval": [
-      27.651917222403245,
-      28.42821997208667
+      117.6337210107229,
+      122.25217468157186
     ]
   },
   "reasons": [
     {
       "conditions": [
         {
-          "feature": "distance_km",
+          "feature": "frequency",
           "operator": "gt",
-          "value": 5.0,
-          "observed": 7.5
+          "value": 2500.0,
+          "observed": 4000.0
+        },
+        {
+          "feature": "frequency",
+          "operator": "lte",
+          "value": 5000.0,
+          "observed": 4000.0
+        },
+        {
+          "feature": "suction-side-displacement-thickness",
+          "operator": "gt",
+          "value": 0.00592927,
+          "observed": 0.0271925
+        },
+        {
+          "feature": "chord-length",
+          "operator": "gt",
+          "value": 0.0254,
+          "observed": 0.0508
+        },
+        {
+          "feature": "free-stream-velocity",
+          "operator": "gt",
+          "value": 39.6,
+          "observed": 55.5
         }
       ],
-      "supports": 28.040068597244957
+      "supports": 119.94294784614738
+    },
+    {
+      "conditions": [
+        {
+          "feature": "frequency",
+          "operator": "gt",
+          "value": 3150.0,
+          "observed": 4000.0
+        },
+        {
+          "feature": "frequency",
+          "operator": "lte",
+          "value": 5000.0,
+          "observed": 4000.0
+        },
+        {
+          "feature": "suction-side-displacement-thickness",
+          "operator": "gt",
+          "value": 0.00544854,
+          "observed": 0.0271925
+        },
+        {
+          "feature": "chord-length",
+          "operator": "gt",
+          "value": 0.0254,
+          "observed": 0.0508
+        }
+      ],
+      "supports": 119.94294784614738
+    },
+    {
+      "conditions": [
+        {
+          "feature": "frequency",
+          "operator": "gt",
+          "value": 2500.0,
+          "observed": 4000.0
+        },
+        {
+          "feature": "frequency",
+          "operator": "lte",
+          "value": 5000.0,
+          "observed": 4000.0
+        },
+        {
+          "feature": "suction-side-displacement-thickness",
+          "operator": "gt",
+          "value": 0.00461377,
+          "observed": 0.0271925
+        },
+        {
+          "feature": "chord-length",
+          "operator": "lte",
+          "value": 0.0508,
+          "observed": 0.0508
+        }
+      ],
+      "supports": 119.94294784614738
+    },
+    {
+      "conditions": [
+        {
+          "feature": "frequency",
+          "operator": "gt",
+          "value": 3150.0,
+          "observed": 4000.0
+        },
+        {
+          "feature": "frequency",
+          "operator": "lte",
+          "value": 8000.0,
+          "observed": 4000.0
+        },
+        {
+          "feature": "suction-side-displacement-thickness",
+          "operator": "gt",
+          "value": 0.00251435,
+          "observed": 0.0271925
+        },
+        {
+          "feature": "chord-length",
+          "operator": "gt",
+          "value": 0.0254,
+          "observed": 0.0508
+        }
+      ],
+      "supports": 119.94294784614738
+    },
+    {
+      "conditions": [
+        {
+          "feature": "frequency",
+          "operator": "gt",
+          "value": 2500.0,
+          "observed": 4000.0
+        },
+        {
+          "feature": "frequency",
+          "operator": "lte",
+          "value": 4000.0,
+          "observed": 4000.0
+        },
+        {
+          "feature": "suction-side-displacement-thickness",
+          "operator": "gt",
+          "value": 0.00566229,
+          "observed": 0.0271925
+        },
+        {
+          "feature": "chord-length",
+          "operator": "gt",
+          "value": 0.0254,
+          "observed": 0.0508
+        }
+      ],
+      "supports": 119.94294784614738
     }
   ],
   "outcome": {
@@ -130,14 +303,17 @@ this complete response:
     "status": "verified",
     "decision": "verified",
     "reliability": "verified",
-    "audit_reference": "sha256:30245c6890da3e7e92760ae770dd8cf7bae1db5eee180d08f6b035eb3511ab81"
+    "audit_reference": "sha256:8daf0cf6862e03c4e62d329cf248d38353c01e8a81773de0ed5255084429c293"
   }
 }
 ```
 
-The response exposes domain conditions instead of tree indexes, logits, or
-internal candidate names. Its audit reference binds it to the detailed proof
-artifact, which can be checked without access to the fitted model:
+</details>
+
+This is model execution evidence, not post-hoc feature importance. The audit
+reference binds the unmodified public reply to its detailed artifact. The
+artifact verifies without fitted model state, and changing the prediction makes
+verification fail:
 
 ```python
 from copy import deepcopy
@@ -151,8 +327,12 @@ assert TabPVN.check_proof(artifact)
 assert TabPVN.check_proof(reply, artifact=artifact)
 
 tampered = deepcopy(reply)
-tampered["prediction"]["value"] = 12.0
+tampered["prediction"]["value"] = 0.0
 assert not TabPVN.check_proof(tampered, artifact=artifact)
+
+lower, upper = reply["reliability"]["interval"]
+observed_target = dataset.y[test_indices[held_out_row]]
+assert lower <= observed_target <= upper
 ```
 
 The distinction is deliberate: verification proves that the disclosed reasons
