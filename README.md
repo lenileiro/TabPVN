@@ -7,6 +7,8 @@
 > commercial use, and operational decision-making require separate written
 > permission. This is not an open-source license. See [LICENSE](LICENSE).
 
+**Start with the differentiator:** [inspect a proof-carrying reply](#proof-carrying-reply).
+
 TabPVN is a deterministic, self-configuring estimator for tabular classification
 and regression. It combines statistical proposers with a symbolic verifier so a
 prediction can be returned with a machine-checkable account of how the fitted
@@ -55,6 +57,110 @@ deployment boundary.
 | Authority | Separate ranking and decision permissions | Predictor output is authoritative by default |
 | Prediction evidence | Replayable conditions, arithmetic, and audit binding | Model-specific inspection or post-hoc explanation |
 | User configuration | Automatic defaults with advanced overrides | Commonly selected through tuning |
+
+## Proof-Carrying Reply
+
+A normal predictor returns a label or number. TabPVN can return the result plus
+a stable, machine-readable proof response. For example, a fitted fraud-like
+classifier received this row:
+
+```json
+{
+  "amount": 181.0,
+  "prior_declines": 3,
+  "account_age_days": 420,
+  "country": "EE"
+}
+```
+
+`predict()` returned class `1` with probability `0.8925`. The current public
+`proof()` API returned this complete response:
+
+```json
+{
+  "schema": "tabpvn.proof/3",
+  "summary": "Prediction: 1. Decision verification passed. Estimated precision is at least 94.5% among similar validation cases. No observed label was supplied.",
+  "prediction": {
+    "task": "classification",
+    "value": 1
+  },
+  "reliability": {
+    "status": "verified",
+    "type": "precision_lower_bound",
+    "value": 0.9447602773487562,
+    "applies_to": "similar_validation_cases"
+  },
+  "reasons": [
+    {
+      "conditions": [
+        {
+          "feature": "amount",
+          "operator": "gt",
+          "value": 140.9929904637624,
+          "observed": 181.0
+        },
+        {
+          "feature": "prior_declines",
+          "operator": "gt",
+          "value": 1.0,
+          "observed": 3.0
+        }
+      ],
+      "supports": 1
+    },
+    {
+      "conditions": [
+        {
+          "feature": "amount",
+          "operator": "gt",
+          "value": 147.51379215167242,
+          "observed": 181.0
+        },
+        {
+          "feature": "prior_declines",
+          "operator": "gt",
+          "value": 1.0,
+          "observed": 3.0
+        }
+      ],
+      "supports": 1
+    }
+  ],
+  "outcome": {
+    "status": "not_observed"
+  },
+  "verification": {
+    "status": "verified",
+    "decision": "verified",
+    "reliability": "verified",
+    "audit_reference": "sha256:5db53cb02213ca733a5b3db30c7473290fa5c8e5764eac8424d64715c09eb680"
+  }
+}
+```
+
+The response exposes domain conditions instead of tree indexes, logits, or
+internal candidate names. Its audit reference binds it to the detailed proof
+artifact, which can be checked without access to the fitted model:
+
+```python
+from copy import deepcopy
+
+from tabpvn import TabPVN
+
+reply = model.proof(row, row=0)
+artifact = model.proof_artifact(row, row=0)
+
+assert TabPVN.check_proof(artifact)
+assert TabPVN.check_proof(reply, artifact=artifact)
+
+tampered = deepcopy(reply)
+tampered["prediction"]["value"] = 0
+assert not TabPVN.check_proof(tampered, artifact=artifact)
+```
+
+The distinction is deliberate: verification proves that the disclosed reasons
+and arithmetic reproduce the model response and its fitted reliability claim.
+It does not claim access to the unknown ground-truth outcome.
 
 ## Measured Performance
 
