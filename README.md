@@ -60,70 +60,67 @@ deployment boundary.
 
 ## Proof-Carrying Reply
 
-A normal predictor returns a label or number. TabPVN can return the result plus
-a stable, machine-readable proof response. For example, a fitted fraud-like
-classifier received this row:
+A normal regressor returns a number. TabPVN can return the number, a validated
+error bound, replayable conditions, and a stable machine-readable proof response.
+This deterministic synthetic delivery-duration example uses the automatic
+default architecture:
+
+```python
+import numpy as np
+import pandas as pd
+
+from tabpvn import TabPVN
+
+rng = np.random.default_rng(3)
+distance_km = np.linspace(0.0, 10.0, 240)
+delivery_minutes = np.where(distance_km <= 5.0, 12.0, 28.0)
+delivery_minutes += rng.normal(0.0, 0.2, 240)
+
+X = pd.DataFrame({"distance_km": distance_km})
+model = TabPVN(task="regression").fit(X, delivery_minutes)
+row = pd.DataFrame({"distance_km": [7.5]})
+```
+
+Input:
 
 ```json
 {
-  "amount": 181.0,
-  "prior_declines": 3,
-  "account_age_days": 420,
-  "country": "EE"
+  "distance_km": 7.5
 }
 ```
 
-`predict()` returned class `1` with probability `0.8925`. The current public
-`proof()` API returned this complete response:
+`predict()` returned `28.0401` minutes. The current public `proof()` API returned
+this complete response:
 
 ```json
 {
   "schema": "tabpvn.proof/3",
-  "summary": "Prediction: 1. Decision verification passed. Estimated precision is at least 94.5% among similar validation cases. No observed label was supplied.",
+  "summary": "Prediction: 28.0401. Decision verification passed. Validated error bound: +/- 0.388151. No observed target was supplied.",
   "prediction": {
-    "task": "classification",
-    "value": 1
+    "task": "regression",
+    "value": 28.040068597244957
   },
   "reliability": {
     "status": "verified",
-    "type": "precision_lower_bound",
-    "value": 0.9447602773487562,
-    "applies_to": "similar_validation_cases"
+    "type": "error_bound",
+    "value": 0.388151374841712,
+    "applies_to": "validated_population",
+    "interval": [
+      27.651917222403245,
+      28.42821997208667
+    ]
   },
   "reasons": [
     {
       "conditions": [
         {
-          "feature": "amount",
+          "feature": "distance_km",
           "operator": "gt",
-          "value": 140.9929904637624,
-          "observed": 181.0
-        },
-        {
-          "feature": "prior_declines",
-          "operator": "gt",
-          "value": 1.0,
-          "observed": 3.0
+          "value": 5.0,
+          "observed": 7.5
         }
       ],
-      "supports": 1
-    },
-    {
-      "conditions": [
-        {
-          "feature": "amount",
-          "operator": "gt",
-          "value": 147.51379215167242,
-          "observed": 181.0
-        },
-        {
-          "feature": "prior_declines",
-          "operator": "gt",
-          "value": 1.0,
-          "observed": 3.0
-        }
-      ],
-      "supports": 1
+      "supports": 28.040068597244957
     }
   ],
   "outcome": {
@@ -133,7 +130,7 @@ classifier received this row:
     "status": "verified",
     "decision": "verified",
     "reliability": "verified",
-    "audit_reference": "sha256:5db53cb02213ca733a5b3db30c7473290fa5c8e5764eac8424d64715c09eb680"
+    "audit_reference": "sha256:30245c6890da3e7e92760ae770dd8cf7bae1db5eee180d08f6b035eb3511ab81"
   }
 }
 ```
@@ -154,7 +151,7 @@ assert TabPVN.check_proof(artifact)
 assert TabPVN.check_proof(reply, artifact=artifact)
 
 tampered = deepcopy(reply)
-tampered["prediction"]["value"] = 0
+tampered["prediction"]["value"] = 12.0
 assert not TabPVN.check_proof(tampered, artifact=artifact)
 ```
 
