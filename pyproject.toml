@@ -3,6 +3,8 @@ name = "tabpvn"
 dynamic = ["version"]
 description = "Deterministic, proof-carrying tabular classification and regression."
 readme = "README.md"
+license = "LicenseRef-TabPVN-Research-Only-1.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.11,<3.13"
 dependencies = [
     "numba>=0.61",
@@ -72,6 +74,7 @@ exclude = [
 
 [tool.hatch.build.targets.sdist]
 include = [
+    "LICENSE",
     "core/**",
     "tabpvn/**",
     "pyproject.toml",
