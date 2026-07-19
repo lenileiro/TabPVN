@@ -1,0 +1,114 @@
+TABPVN RESEARCH-ONLY SOURCE LICENSE 1.0
+
+Copyright (c) 2026 Anthony Leiro. All rights reserved.
+
+This license permits access to TabPVN for research and evaluation only. It is
+not an open-source license.
+
+1. Definitions
+
+"Software" means the TabPVN source code, object code, documentation, model
+artifacts, and other materials distributed with this license, including any
+modification or derivative work based on them.
+
+"Research Use" means non-production investigation, experimentation, testing,
+benchmarking, validation of research hypotheses, or teaching directly connected
+to research. Research Use may be performed by an individual or organization,
+including a for-profit organization, only when the Software and its outputs are
+not used for Commercial Use or Production Use.
+
+"Commercial Use" means using the Software or its outputs to sell, license,
+rent, monetize, provide, develop, improve, or validate a product or service; to
+perform a fee-based service for a third party; or otherwise to obtain a direct
+commercial benefit. Internal evaluation by a for-profit organization is not
+Commercial Use when it is limited to deciding whether to seek a separate
+commercial license.
+
+"Production Use" means using the Software or its outputs in a live,
+customer-facing, revenue-generating, or operational system or business process,
+including automated or assisted decisions that affect a person, property,
+rights, access, eligibility, employment, credit, insurance, healthcare, safety,
+or money.
+
+2. Research License Grant
+
+Subject to this license, the copyright holder grants you a worldwide,
+non-exclusive, non-transferable, royalty-free license to:
+
+a. use, reproduce, and modify the Software solely for Research Use;
+
+b. distribute the Software, with or without modifications, solely to enable
+   Research Use by recipients who receive the Software under this same license;
+   and
+
+c. publish research papers, benchmark measurements, and research findings
+   produced through permitted Research Use.
+
+No right is granted for Commercial Use or Production Use. Rights not expressly
+granted are reserved by the copyright holder.
+
+3. Conditions
+
+Every copy or substantial portion of the Software that you distribute must:
+
+a. include this license and all copyright, attribution, and authorship notices;
+
+b. identify material modifications you made; and
+
+c. be licensed only under this license, without additional terms that expand
+   the recipient's rights or restrict the recipient from complying with it.
+
+You may not sublicense or transfer your rights under this license. You may not
+use the names, logos, or trademarks of TabPVN or its contributors to suggest
+endorsement without prior written permission.
+
+4. Separate Permission
+
+Commercial Use, Production Use, and any use outside Research Use require a
+separate written license from the copyright holder. A separate license may be
+requested from the copyright holder through the TabPVN project repository.
+
+5. Patent Grant and Retaliation
+
+Each contributor grants you a patent license, limited to the contributor's
+patent claims necessarily infringed by that contributor's contribution, solely
+for your permitted Research Use. This patent license terminates immediately if
+you initiate or maintain a patent claim alleging that the Software or a
+contribution infringes a patent.
+
+6. Compliance and Termination
+
+Your rights terminate automatically when you breach this license. If the breach
+is curable, your rights are reinstated when you cure it within 30 days after
+becoming aware of it. A later breach terminates your rights permanently unless
+the copyright holder agrees otherwise in writing. Sections that by their nature
+should survive termination, including ownership, disclaimers, and limitations
+of liability, survive.
+
+7. Ownership
+
+The Software is licensed, not sold. The copyright holder and contributors retain
+all ownership and intellectual-property rights in their respective work. No
+license is granted to use any trademark except as required for reasonable and
+customary attribution.
+
+8. Disclaimer of Warranty
+
+THE SOFTWARE IS PROVIDED "AS IS" AND WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, EXPRESS OR IMPLIED, INCLUDING WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE, TITLE, AND NON-INFRINGEMENT. YOU BEAR ALL RISK ARISING FROM
+USE OF THE SOFTWARE AND ITS OUTPUTS.
+
+9. Limitation of Liability
+
+TO THE MAXIMUM EXTENT PERMITTED BY LAW, NO COPYRIGHT HOLDER OR CONTRIBUTOR WILL
+BE LIABLE FOR ANY DIRECT, INDIRECT, SPECIAL, INCIDENTAL, CONSEQUENTIAL,
+EXEMPLARY, OR PUNITIVE DAMAGES, OR FOR ANY LOSS OF DATA, PROFITS, REVENUE,
+GOODWILL, OR BUSINESS INTERRUPTION, ARISING FROM OR RELATED TO THE SOFTWARE OR
+THIS LICENSE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+10. Severability and Acceptance
+
+If any provision of this license is unenforceable, it will be limited to the
+minimum extent necessary and the remaining provisions will continue in effect.
+By exercising any permission granted by this license, you accept its terms.
