@@ -2,6 +2,11 @@
 
 **Proof-carrying tabular prediction without pretrained weights.**
 
+> [!IMPORTANT]
+> TabPVN is source-available for research and evaluation only. Production use,
+> commercial use, and operational decision-making require separate written
+> permission. This is not an open-source license. See [LICENSE](LICENSE).
+
 TabPVN is a deterministic, self-configuring estimator for tabular classification
 and regression. It combines statistical proposers with a symbolic verifier so a
 prediction can be returned with a machine-checkable account of how the fitted
@@ -19,6 +24,107 @@ out-of-fold or future-window evidence admits them.
 
 > TabPVN proofs verify model execution and declared statistical evidence. They do
 > not guarantee that an unknown individual label or target is correct.
+
+## Research Contribution
+
+TabPVN introduces a **Proposer-Verifier Network (PVN)** for tabular learning. A
+PVN treats model construction as validated program synthesis rather than a
+single opaque optimization step:
+
+1. **Proposers generate explicit candidate programs.** Candidates include
+   additive threshold regions, categorical posteriors, numeric intervals,
+   affine reads, compression evidence, and causal temporal state.
+2. **A verifier assigns bounded authority.** Each candidate is measured on
+   training-only out-of-fold predictions, or on past-to-future windows for event
+   data. It may receive ranking authority, decision authority, both, or neither.
+3. **The selected program carries its execution proof.** Prediction conditions
+   and arithmetic can be replayed independently by the small symbolic kernel.
+4. **The default is the research method.** Architecture selection, imbalance
+   handling, calibration, and scale budgets are automatic; dataset-specific
+   tuning is not required.
+
+This separates two questions that conventional estimators usually combine:
+*what structure might predict well?* and *what evidence permits that structure
+to affect a result?* The proposer can be aggressive; the verifier remains the
+deployment boundary.
+
+| Property | TabPVN research path | Conventional fitted predictor |
+| --- | --- | --- |
+| Candidate search | Multiple explicit, bounded program families | One configured model family |
+| Admission | Out-of-fold or future-window transfer evidence | Training objective and configured regularization |
+| Authority | Separate ranking and decision permissions | Predictor output is authoritative by default |
+| Prediction evidence | Replayable conditions, arithmetic, and audit binding | Model-specific inspection or post-hoc explanation |
+| User configuration | Automatic defaults with advanced overrides | Commonly selected through tuning |
+
+## Measured Performance
+
+These results are research snapshots, not a claim that TabPVN is state of the
+art. They report fixed protocols and include the negative primary-comparator
+result.
+
+### TabArena versus histogram GBDT
+
+The last completed packaged-default promotion run used official TabArena v0.1
+fold 0 for all 51 tasks. Classification was scored by ROC AUC (macro one-vs-one
+for multiclass); regression was scored by RMSE. Each model used the same task
+split, and a win means higher AUC or lower RMSE.
+
+| Fold-0 result | TabPVN | Histogram GBDT |
+| --- | ---: | ---: |
+| Average rank across 51 tasks | **1.235** | 1.765 |
+| Task wins | **39 / 51** | 12 / 51 |
+| Classification wins | **26 / 38** | 12 / 38 |
+| Regression wins | **13 / 13** | 0 / 13 |
+
+Across the 38 classification tasks, the mean paired difference was **+0.0079
+ROC AUC** with a 95% normal-approximation interval of **[+0.0038, +0.0121]**.
+Across the 13 regression tasks, the mean paired reduction in RMSE was **5.45%**,
+with a 95% normal-approximation interval of **[2.66%, 8.25%]**.
+
+This is a one-fold architecture-promotion result. It is useful evidence against
+the fixed GBDT baseline, but it is not enough for a general superiority claim.
+
+### Primary comparison: TabPFN-3
+
+A bounded CPU check covered four official fold-0 classification tasks. TabPVN
+did not beat TabPFN-3 on this slice:
+
+| Dataset | TabPVN ROC AUC | TabPFN-3 ROC AUC |
+| --- | ---: | ---: |
+| `maternal_health_risk` | 0.9464 | **0.9652** |
+| `credit-g` | 0.7619 | **0.7824** |
+| `qsar-biodeg` | 0.9229 | **0.9318** |
+| `taiwanese_bankruptcy_prediction` | 0.9358 | **0.9509** |
+
+The current evidence therefore supports "competitive with a strong fixed GBDT
+baseline on this protocol," not "better than TabPFN-3" or "best in the world."
+TabPFN-3 remains the primary research target.
+
+### Million-row scale check
+
+The completed Kaggle HIGGS scale audit used 1,000,000 training rows, 50,000 test
+rows, and 28 numeric features. On an Apple M1 Pro with 16 GB RAM, the default
+TabPVN path recorded:
+
+| Metric | Result |
+| --- | ---: |
+| ROC AUC | 0.8284 |
+| Accuracy | 0.7474 |
+| Log loss | 0.5064 |
+| Fit time | 101.4 s |
+| Probability inference, 50K rows | 1.52 s |
+| Peak resident memory | 0.84 GiB |
+
+This run demonstrates bounded million-row execution; it did not include a
+same-run competitor and therefore is not an accuracy comparison. The wider
+BeyondArena 1M+ audit also exposed unresolved memory and timeout limits on wide
+tables, which remain active research work.
+
+Results were produced on macOS with Python 3.11, NumPy 2.4, and scikit-learn
+1.6. The Arena summary corresponds to implementation fingerprint
+`43b88eec9ae1d545`; the HIGGS snapshot was recorded on 2026-07-16. Regenerate
+results after implementation or dependency changes before making comparative
+claims.
 
 ## Core Idea
 
@@ -399,6 +505,11 @@ the experiment:
 
 ## License
 
-No open-source license has been selected yet. Public visibility alone does not
-grant permission to copy, modify, or redistribute the code. Add a `LICENSE` file
-before accepting external redistribution or contributions.
+TabPVN is distributed under the custom
+[TabPVN Research-Only Source License 1.0](LICENSE). It permits use,
+modification, reproducibility work, benchmarking, and redistribution under the
+same terms solely for research and evaluation. Commercial use, production use,
+commercial product development, fee-based services, and operational decisions
+require a separate written license.
+
+This is a source-available license, not an OSI-approved open-source license.
