@@ -2,6 +2,7 @@
 name = "tabpvn"
 dynamic = ["version"]
 description = "Deterministic, proof-carrying tabular classification and regression."
+readme = "README.md"
 requires-python = ">=3.11,<3.13"
 dependencies = [
     "numba>=0.61",
