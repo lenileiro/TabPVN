@@ -115,5 +115,5 @@ def test_runtime_wheel_excludes_research_packages():
     assert "tabpvn/fol_regression.py" in excluded
 
     sdist = pyproject["tool"]["hatch"]["build"]["targets"]["sdist"]
-    assert sdist["include"] == ["core/**", "tabpvn/**", "pyproject.toml"]
+    assert sdist["include"] == ["LICENSE", "core/**", "tabpvn/**", "pyproject.toml"]
     assert set(sdist["exclude"]) == excluded
