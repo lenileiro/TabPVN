@@ -73,6 +73,27 @@ def test_automatic_categorical_multiclass_fit_keeps_incumbent_verifier(monkeypat
     assert "stratified_holdout" not in model.boost_
     assert model._pred.stratified_holdout is False
     assert model.multiclass_architecture_report_["stratified_verifier"] is False
+    pair_report = next(
+        row for row in model.booster_selection_report_ if row["name"] == "adaptive_multiclass_pair_growth"
+    )
+    assert pair_report["controller_enabled"] is False
+    assert pair_report["reason"] == "categorical_schema"
+
+
+def test_adaptive_pair_growth_is_bounded_to_supported_multiclass_schemas():
+    X, y = _three_class_table(rows=450)
+    model = TabPVN(seed=3)
+    base = {"rounds": 20, "depth": 4}
+
+    selected = model._with_adaptive_multiclass_pair_growth(X, y, base)
+
+    assert selected["max_leaves"] == 24
+    assert selected["best_first_pair"] is True
+    assert selected["adaptive_best_first_pair"] is True
+    assert model._with_adaptive_multiclass_pair_growth(X[:399], y[:399], base) == base
+    assert model._with_adaptive_multiclass_pair_growth(np.zeros((450, 129)), y, base) == base
+    model._cat_groups = ((0, 1),)
+    assert model._with_adaptive_multiclass_pair_growth(X, y, base) == base
 
 
 def test_multiclass_gate_deploys_rank_checkpoint_without_extra_fold_fits(monkeypatch):

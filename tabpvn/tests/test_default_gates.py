@@ -125,7 +125,10 @@ def test_classifier_tuning_reuses_stratified_rung_evidence(monkeypatch):
     config = model._auto_tune_clf(X, y)
 
     assert config["depth"] == 6
-    assert len(rank_calls) == 2
+    # Each candidate receives one aggregate score plus two paired verifier
+    # blocks, all computed from the same validation predictions.
+    assert len(rank_calls) == 6
+    np.testing.assert_array_equal(rank_calls[0][0], rank_calls[3][0])
     np.testing.assert_array_equal(validation_rows[0], validation_rows[1])
     validation_y = y[validation_rows[0]]
     np.testing.assert_array_equal(np.unique(validation_y, return_counts=True)[1], [120, 30])

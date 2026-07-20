@@ -1853,6 +1853,9 @@ class AdditiveCertifiedClassifier:
             training_trace if training_trace is not None and "tree_counts" in training_trace else None
         )
         self.residual_dynamics_ = None if training_trace is None else training_trace.get("residual_dynamics")
+        self.residual_dynamics_monitored_rounds_ = (
+            0 if training_trace is None else int(training_trace.get("dynamics_monitored_rounds", 0))
+        )
         selected_dynamics_rounds = (
             0 if training_trace is None else int(training_trace.get("selected_rounds", 0))
         )

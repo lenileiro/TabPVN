@@ -16,6 +16,8 @@ import numpy as np
 
 from tabpvn.residual_dynamics import ResidualDynamicsTracker, hardest_class_pair
 
+_ADAPTIVE_PAIR_PROBE_ROUNDS = 16
+
 # A tree's histogram build is independent across split features.  Above this
 # amount of row-feature work, assigning one feature at a time to Numba workers
 # amortizes the parallel-region overhead on ordinary desktop CPUs.  Smaller
@@ -3742,6 +3744,9 @@ def reason_boost_softmax(  # noqa: C901 - multiclass boost training loop
     )
     adaptive_pair: tuple[int, int] | tuple[()] = ()
     growth_schedule: list[tuple[int, int] | tuple[()]] = []
+    dynamics_monitoring = dynamics_tracker is not None
+    dynamics_monitored_rounds = 0
+    adaptive_pair_activated = False
     return_trace = bool(track_validation_metrics or dynamics_enabled)
 
     def checkpoint_round():
@@ -3758,17 +3763,29 @@ def reason_boost_softmax(  # noqa: C901 - multiclass boost training loop
         return all(bad_rounds[metric] >= patience for metric in metrics), round_scores
 
     def complete_round(round_update, growth_pair):
-        nonlocal adaptive_pair
+        nonlocal adaptive_pair, adaptive_pair_activated, dynamics_monitored_rounds, dynamics_monitoring
         stopped, round_scores = checkpoint_round()
         if dynamics_tracker is not None:
             if round_update is None:
                 raise RuntimeError("residual-dynamics round completed without verifier updates")
-            adaptive_pair = dynamics_tracker.observe(
-                Fv,
-                round_update,
-                growth_pair,
-                validation_scores=round_scores,
-            )
+            if dynamics_monitoring:
+                dynamics_monitored_rounds += 1
+                adaptive_pair = dynamics_tracker.observe(
+                    Fv,
+                    round_update,
+                    growth_pair,
+                    validation_scores=round_scores,
+                )
+                adaptive_pair_activated = adaptive_pair_activated or bool(adaptive_pair)
+                if (
+                    adaptive_best_first_pair
+                    and not track_residual_dynamics
+                    and not adaptive_pair_activated
+                    and len(growth_schedule) + 1 >= _ADAPTIVE_PAIR_PROBE_ROUNDS
+                ):
+                    dynamics_monitoring = False
+            else:
+                adaptive_pair = ()
             growth_schedule.append(tuple(growth_pair) if growth_pair else ())
         return stopped
 
@@ -3936,6 +3953,7 @@ def reason_boost_softmax(  # noqa: C901 - multiclass boost training loop
                 trace.update(
                     residual_dynamics=dynamics_records,
                     pair_growth_schedule=list(growth_schedule),
+                    dynamics_monitored_rounds=dynamics_monitored_rounds,
                     selected_rounds=selected_rounds,
                 )
         if not refit or keep == 0:

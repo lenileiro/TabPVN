@@ -91,6 +91,47 @@ def test_hard_pair_growth_replays_through_certified_scalar_trees():
     assert model.kernel_certify(X, n_trees=18, sample=40)["scores_reproduced"] == 1.0
 
 
+@pytest.mark.parametrize("activate", [False, True])
+def test_adaptive_pair_monitor_has_bounded_inactive_probe(monkeypatch, activate):
+    rng = np.random.default_rng(909)
+    X = rng.normal(size=(360, 6))
+    y = np.repeat(np.arange(3), 120)
+    calls = []
+
+    class Tracker:
+        records = []
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def observe(self, *_args, **_kwargs):
+            calls.append(len(calls))
+            return (0, 1) if activate and len(calls) >= 2 else ()
+
+    monkeypatch.setattr(trees, "ResidualDynamicsTracker", Tracker)
+    result = reason_boost_softmax(
+        X,
+        y,
+        rounds=24,
+        depth=3,
+        min_leaf=8,
+        holdout=0.2,
+        patience=30,
+        refit=False,
+        stratified_holdout=True,
+        sub=1.0,
+        mf=1.0,
+        max_leaves=8,
+        best_first_pair=True,
+        adaptive_best_first_pair=True,
+    )
+    trace = result[-1]
+
+    assert len(trace["pair_growth_schedule"]) == 24
+    assert len(calls) == (24 if activate else trees._ADAPTIVE_PAIR_PROBE_ROUNDS)
+    assert trace["dynamics_monitored_rounds"] == len(calls)
+
+
 def test_shared_softmax_tree_uses_one_partition_with_centered_vector_leaves():
     rng = np.random.default_rng(901)
     X = rng.normal(size=(800, 10))

@@ -36,6 +36,12 @@ import numpy as np
 from core.fol_kg_induction import induce
 from core.fol_kg_induction import verify as _kg_verify
 from core.kernel_fol import FOLKernel
+from tabpvn.candidate_allocation import (
+    VerifierScore,
+    allocate_candidates,
+    best_candidate,
+    verification_blocks,
+)
 from tabpvn.certified_boost import AdditiveCertifiedClassifier, AdditiveCertifiedRegressor, _fit_sample
 from tabpvn.operating_points import fit_binary_thresholds as _fit_binary_thresholds
 from tabpvn.preprocessing import (
@@ -117,6 +123,8 @@ _MULTICLASS_RULE_GATE_ROUNDS = 160
 _MULTICLASS_RULE_MIN_FOLD_GAIN = 0.001
 _MULTICLASS_RULE_MIN_MEAN_GAIN = 0.002
 _MULTICLASS_HEAD_SCREEN_MIN_FOLD_GAIN = -0.002
+_MULTICLASS_ADAPTIVE_PAIR_MAX_FEATURES = 128
+_MULTICLASS_ADAPTIVE_PAIR_MAX_LEAVES = 24
 
 # A dominant multiclass prior can bury an OOF-admitted minority rank signal in
 # the softmax denominator. A fixed geometric half-step toward a uniform prior
@@ -1191,6 +1199,7 @@ class TabPVN:
         self.interaction_features_ = []
         self.candidate_report_ = []
         self.booster_selection_report_ = []
+        self.search_allocation_report_ = []
         self.category_memory_report_ = []
         self.category_posterior_report_ = []
         self.numeric_interval_report_ = []
@@ -1761,6 +1770,7 @@ class TabPVN:
         self.interaction_features_ = []
         self.candidate_report_ = [gate_report("certified_boost", True, stage="predictor")]
         self.booster_selection_report_ = [gate_report("auto_boost", True, stage="predictor")]
+        self.search_allocation_report_ = []
         self.rare_architecture_report_ = []
         self.regression_loss_report_ = []
         self.feature_screen_report_ = []
@@ -2073,15 +2083,42 @@ class TabPVN:
         self._affine_decision_oof_labels = None  # transient selected OOF top-1 decisions
         self._sdm = None  # SDM-attention associative-memory member (set below for text classification)
         if self.additive:  # full-coverage proof-carrying ensemble
-            predictor_config = boost
-            if self.mode == "classification" and boost.get("adaptive_best_first_pair", False):
-                predictor_config = dict(boost, track_residual_dynamics=True)
             predictor = (
-                self._classifier(**predictor_config)
+                self._classifier(**boost)
                 if self.mode == "classification"
                 else AdditiveCertifiedRegressor(seed=self.seed, **boost)
             )
             self._pred = self._fit_certified(predictor, X, y)
+            if self.mode == "classification" and np.unique(y).size > 2:
+                adaptive_pair_enabled = bool(boost.get("adaptive_best_first_pair", False))
+                deployed_schedule = tuple(getattr(self._pred, "pair_growth_schedule_", ()))
+                active_rounds = sum(bool(pair) for pair in deployed_schedule)
+                if adaptive_pair_enabled:
+                    reason = "verified_residual_pair" if active_rounds else "no_verified_residual_pair"
+                elif len(y) < _MULTICLASS_RULE_GATE_MIN_ROWS:
+                    reason = "insufficient_verifier_rows"
+                elif self.n_input_features_ > _MULTICLASS_ADAPTIVE_PAIR_MAX_FEATURES:
+                    reason = "wide_schema"
+                elif self._cat_groups or (
+                    self._prep is not None
+                    and (getattr(self._prep, "cat_cols", ()) or getattr(self._prep, "text_cols", ()))
+                ):
+                    reason = "categorical_schema"
+                else:
+                    reason = "controller_not_eligible"
+                self.booster_selection_report_.append(
+                    gate_report(
+                        "adaptive_multiclass_pair_growth",
+                        bool(active_rounds),
+                        stage="predictor",
+                        reason=reason,
+                        controller_enabled=adaptive_pair_enabled,
+                        evidence_source="held_out_residual_dynamics",
+                        monitored_rounds=int(getattr(self._pred, "residual_dynamics_monitored_rounds_", 0)),
+                        deployed_rounds=int(len(deployed_schedule)),
+                        active_rounds=int(active_rounds),
+                    )
+                )
             if self._fit_validation is not None:
                 self.validation_report_["fit_sampling"] = dict(self._pred.fit_sampling_)
             if self.rare_event_ and self.rare_event_report_ is not None:
@@ -4732,14 +4769,36 @@ class TabPVN:
             self._bal_thr = None
             self._rare_thr = None
 
+    def _allocate_search_budget(
+        self,
+        scores,
+        candidates,
+        baseline_index,
+        *,
+        keep,
+        maximize,
+        prune_dominated,
+    ):
+        """Allocate the next search rung while preserving the absolute anchors."""
+
+        return allocate_candidates(
+            scores,
+            candidates,
+            baseline_index,
+            keep=keep,
+            maximize=maximize,
+            prune_dominated=prune_dominated,
+        )
+
     def _successive_halving(self, cands, base_idx, score_fn, rungs, maximize):
-        """Hyperband-style SUCCESSIVE HALVING over the candidate configs. Evaluate EVERY candidate at a tiny
-        budget (few rounds, small subsample, 1 fold), keep the top half, re-evaluate the survivors at a larger
-        budget, and repeat — so only the finalists ever pay the full, faithful fit. Cheap rungs screen out the
-        obviously-worse configs (the deep/overfitting corners die immediately), which is what lets the FINAL
-        rung afford a larger, in-regime subsample without the old big/small special-case. BASE is always
-        promoted so the final hysteresis can compare it fairly. Deterministic. Returns (best_idx, final_scores)
-        where final_scores holds each finalist's score at the highest rung it reached."""
+        """Verifier-relative SUCCESSIVE HALVING over the candidate configs.
+
+        Every candidate receives the tiny first budget. Paired metric blocks then allocate the next budget by
+        median group-relative evidence while retaining both the absolute metric leader and BASE. Starting at
+        the semifinal, a candidate can be removed early when another candidate is at least as good on every
+        paired block. Only finalists pay for the full fit, and the final winner is still chosen by the original
+        absolute objective before the caller's baseline hysteresis. Deterministic.
+        """
         survivors = list(range(len(cands)))
         scores = {}
         for ri, rung in enumerate(rungs):
@@ -4752,12 +4811,26 @@ class TabPVN:
             )  # survivors' scores overwrite with their higher-budget (more faithful) estimate
             if ri == len(rungs) - 1:
                 break
-            ranked = sorted(survivors, key=lambda i: cur[i], reverse=maximize)
-            keep = max(1, (len(ranked) + 1) // 2)
-            survivors = ranked[:keep]
-            if base_idx not in survivors:
-                survivors.append(base_idx)  # never prune BASE — it must reach the final rung
-        best = (max if maximize else min)(survivors, key=lambda i: scores[i])
+            keep = max(1, (len(survivors) + 1) // 2)
+            decision = self._allocate_search_budget(
+                cur,
+                survivors,
+                base_idx,
+                keep=keep,
+                maximize=maximize,
+                # The first rung remains broad. Consistent paired dominance can
+                # reduce only the semifinal-to-final allocation.
+                prune_dominated=ri > 0,
+            )
+            report = dict(decision.report)
+            report["rung"] = int(ri)
+            report["budget"] = {
+                key: int(value) if isinstance(value, (int, np.integer)) else value
+                for key, value in rung.items()
+            }
+            self.search_allocation_report_.append(report)
+            survivors = list(decision.promoted)
+        best = best_candidate(scores, survivors, maximize=maximize)
         return best, scores, survivors
 
     def _auto_rare_architecture(self, X, y):
@@ -5033,6 +5106,7 @@ class TabPVN:
 
             def run():
                 errs = []
+                paired_errs = []
                 for tr, va in splits:
                     m = self._fit_certified(
                         AdditiveCertifiedRegressor(seed=self.seed, rounds=rung["rounds"], refit=False, **cfg),
@@ -5040,8 +5114,15 @@ class TabPVN:
                         ys[tr],
                         groups=(None if groups is None else groups[tr]),
                     )
-                    errs.append(np.sqrt(((m.predict(Xs[va]) - ys[va]) ** 2).mean()))
-                return float(np.mean(errs)), tuple(float(err) for err in errs)
+                    residual = m.predict(Xs[va]) - ys[va]
+                    errs.append(np.sqrt(np.square(residual).mean()))
+                    paired_errs.extend(
+                        np.sqrt(np.square(residual[block]).mean()) for block in verification_blocks(len(va))
+                    )
+                return VerifierScore(
+                    (float(np.mean(errs)), tuple(float(err) for err in errs)),
+                    tuple(float(err) for err in paired_errs),
+                )
 
             return run
 
@@ -5090,6 +5171,29 @@ class TabPVN:
         pick["huber"] = None if squared_selected else 0.95
         return dict(rounds=2000, patience=60, **{k: v for k, v in pick.items() if k != "patience"})
 
+    def _with_adaptive_multiclass_pair_growth(self, X, y, config):
+        """Attach bounded residual-pair capacity to eligible multiclass configs."""
+
+        config = dict(config)
+        prep = getattr(self, "_prep", None)
+        categorical_schema = bool(
+            self._cat_groups
+            or (prep is not None and (getattr(prep, "cat_cols", ()) or getattr(prep, "text_cols", ())))
+        )
+        if (
+            len(y) >= _MULTICLASS_RULE_GATE_MIN_ROWS
+            and np.unique(y).size > 2
+            and X.shape[1] <= _MULTICLASS_ADAPTIVE_PAIR_MAX_FEATURES
+            and not categorical_schema
+            and not getattr(self, "rare_event_", False)
+        ):
+            config.update(
+                max_leaves=_MULTICLASS_ADAPTIVE_PAIR_MAX_LEAVES,
+                best_first_pair=True,
+                adaptive_best_first_pair=True,
+            )
+        return config
+
     def _auto_tune_clf(self, X, y):  # noqa: C901 - bounded search protocol
         """SELECT the classifier configuration from the data (the classifier's static defaults are weak on many
         datasets) via SUCCESSIVE HALVING on depth / learning-rate / leaf size. Cheap rungs screen every config
@@ -5105,9 +5209,17 @@ class TabPVN:
         leaf = int(np.clip(minority_count // 20, 5, 50)) if rare_event else int(np.clip(n // 150, 20, 50))
         fine = max(20, leaf // 2)  # finer leaves for the deeper capacity configs
         if rare_event and minority_count < 8:
-            return dict(rounds=600, lr=0.05, depth=4, leaf=leaf, patience=20)
+            return self._with_adaptive_multiclass_pair_growth(
+                X,
+                y,
+                dict(rounds=600, lr=0.05, depth=4, leaf=leaf, patience=20),
+            )
         if n < 400:
-            return dict(rounds=600, lr=0.05, depth=4, leaf=leaf, patience=20)
+            return self._with_adaptive_multiclass_pair_growth(
+                X,
+                y,
+                dict(rounds=600, lr=0.05, depth=4, leaf=leaf, patience=20),
+            )
         BASE = 1  # depth6/lr0.05: strong conservative default
         # The depth-10 high-capacity corner only wins with enough data; on small n it overfits and loses to
         # the depth-4/6/8 configs anyway (see comment below), so screening it there just burns a rung-0 fit.
@@ -5270,7 +5382,7 @@ class TabPVN:
             Xs, ys, sample_weight, groups, splits = evidence(rung)
 
             def run():
-                rank_scores, rare_scores, accuracies = [], [], []
+                rank_scores, paired_rank_scores, rare_scores, accuracies = [], [], [], []
                 for tr, va in splits:
                     classifier_kwargs = dict(
                         rounds=rung["rounds"],
@@ -5301,6 +5413,10 @@ class TabPVN:
                     class_index = {value: index for index, value in enumerate(classes)}
                     yidx = np.array([class_index[value] for value in ys[va]], dtype=np.int64)
                     rank_scores.append(_classification_rank_score(yidx, proba))
+                    paired_rank_scores.extend(
+                        _classification_rank_score(yidx[block], proba[block])
+                        for block in verification_blocks(len(va), yidx)
+                    )
                     if rare_event:
                         from sklearn.metrics import average_precision_score
 
@@ -5312,16 +5428,21 @@ class TabPVN:
                                 sample_weight=validation_weight,
                             )
                         )
-                # Tuples compare lexicographically, so successive halving ranks probability quality first and
-                # uses rare-event AP / accuracy only as deterministic tie-breaks. Both finalists reach the
-                # same last rung, so the comparison remains paired.
+                # The final absolute ordering ranks probability quality first and uses rare-event AP / accuracy
+                # only as deterministic tie-breaks. Paired rank blocks affect budget allocation, not deployment.
                 if rare_event:
-                    return (
-                        float(np.mean(rank_scores)),
-                        float(np.mean(rare_scores)),
-                        float(np.mean(accuracies)),
+                    return VerifierScore(
+                        (
+                            float(np.mean(rank_scores)),
+                            float(np.mean(rare_scores)),
+                            float(np.mean(accuracies)),
+                        ),
+                        tuple(float(score) for score in paired_rank_scores),
                     )
-                return float(np.mean(rank_scores)), float(np.mean(accuracies))
+                return VerifierScore(
+                    (float(np.mean(rank_scores)), float(np.mean(accuracies))),
+                    tuple(float(score) for score in paired_rank_scores),
+                )
 
             return run
 
@@ -5339,7 +5460,11 @@ class TabPVN:
                     error=type(error).__name__,
                 )
             )
-            return dict(rounds=800, patience=20, **cands[BASE])
+            return self._with_adaptive_multiclass_pair_growth(
+                X,
+                y,
+                dict(rounds=800, patience=20, **cands[BASE]),
+            )
         if rare_event:
             best_rank, best_ap, best_accuracy = scores[best]
             base_rank, base_ap, base_accuracy = scores[BASE]
@@ -5356,7 +5481,9 @@ class TabPVN:
             pick["allowed"] = tuple(int(feature) for feature in final_allowed)
         # patience 30->20: clf holdout log-loss reaches ~99.7% of its final gain by ~round 100, so 20 trailing
         # rounds past the best is ample; 30 just fits ~10 extra trees per class that don't move accuracy.
-        return dict(rounds=800, patience=20, **{k: v for k, v in pick.items() if k != "patience"})
+        return self._with_adaptive_multiclass_pair_growth(
+            X, y, dict(rounds=800, patience=20, **{k: v for k, v in pick.items() if k != "patience"})
+        )
 
     def _auto_rank_checkpoint_clf(self, X, y, boost):
         """Gate an AUC-selected prefix from the same transparent tree trace.
