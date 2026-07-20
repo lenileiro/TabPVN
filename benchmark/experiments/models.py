@@ -189,6 +189,46 @@ def _tabpvn(task: str):
     return TabPVN(seed=0, task=task)
 
 
+def _tabpvn_legacy_allocation(task: str):
+    """Research ablation: pre-verifier absolute top-half search allocation."""
+    from tabpvn import TabPVN
+    from tabpvn.candidate_allocation import AllocationDecision, score_values
+
+    class _LegacyAllocation(TabPVN):
+        def _allocate_search_budget(
+            self,
+            scores,
+            candidates,
+            baseline_index,
+            *,
+            keep,
+            maximize,
+            prune_dominated,
+        ):
+            del prune_dominated
+            ranked = sorted(
+                candidates,
+                key=lambda index: score_values(scores[index]),
+                reverse=maximize,
+            )
+            promoted = ranked[:keep]
+            if baseline_index not in promoted:
+                promoted.append(baseline_index)
+            return AllocationDecision(
+                tuple(promoted),
+                {
+                    "stage": "candidate_allocation",
+                    "method": "legacy_absolute_top_half",
+                    "absolute_anchor": "certified_baseline",
+                    "evaluated_candidates": int(len(candidates)),
+                    "promoted_candidates": int(len(promoted)),
+                    "baseline_retained": True,
+                },
+            )
+
+    return _LegacyAllocation(seed=0, task=task)
+
+
 def _tabpvn_base(task: str):
     """Research-only ablation: the packaged default without symbolic programs."""
     from tabpvn import TabPVN
@@ -242,6 +282,8 @@ def _tabpvn_best_first_multiclass(task: str):
                 config = dict(config)
                 config["depth"] = max(12, int(config.get("depth", 4)))
                 config["max_leaves"] = 24
+                config["best_first_pair"] = False
+                config["adaptive_best_first_pair"] = False
             return config
 
     return _BestFirstMulticlass(seed=0, task=task)
@@ -258,26 +300,27 @@ def _tabpvn_hard_pair_best_first(task: str):
                 config = dict(config)
                 config["max_leaves"] = 24
                 config["best_first_pair"] = True
+                config["adaptive_best_first_pair"] = False
             return config
 
     return _HardPairBestFirst(seed=0, task=task)
 
 
 def _tabpvn_adaptive_hard_pair(task: str):
-    """Research candidate: verifier-triggered hard-pair capacity by residual phase."""
+    """Compatibility alias for the promoted adaptive hard-pair default."""
+    return _tabpvn(task)
+
+
+def _tabpvn_no_adaptive_hard_pair(task: str):
+    """Research ablation: disable verifier-triggered multiclass pair capacity."""
     from tabpvn import TabPVN
 
-    class _AdaptiveHardPair(TabPVN):
-        def _auto_tune_clf(self, X, y):
-            config = super()._auto_tune_clf(X, y)
-            if np.unique(y).size > 2 and not getattr(self, "_cat_groups", ()):
-                config = dict(config)
-                config["max_leaves"] = 24
-                config["best_first_pair"] = True
-                config["adaptive_best_first_pair"] = True
-            return config
+    class _NoAdaptiveHardPair(TabPVN):
+        def _with_adaptive_multiclass_pair_growth(self, X, y, config):
+            del X, y
+            return dict(config)
 
-    return _AdaptiveHardPair(seed=0, task=task)
+    return _NoAdaptiveHardPair(seed=0, task=task)
 
 
 def _tabpvn_unstratified_multiclass(task: str):
@@ -353,12 +396,14 @@ REGISTRY: dict[str, Factory] = {
     "catboost": _catboost,
     "tabpfn": _tabpfn,
     "tabpvn": _tabpvn,
+    "tabpvn_legacy_allocation": _tabpvn_legacy_allocation,
     "tabpvn_base": _tabpvn_base,
     "tabpvn_freq": _tabpvn_frequency_only,
     "tabpvn_shared": _tabpvn_shared_multiclass,
     "tabpvn_best_first_multiclass": _tabpvn_best_first_multiclass,
     "tabpvn_hard_pair_best_first": _tabpvn_hard_pair_best_first,
     "tabpvn_adaptive_hard_pair": _tabpvn_adaptive_hard_pair,
+    "tabpvn_no_adaptive_hard_pair": _tabpvn_no_adaptive_hard_pair,
     "tabpvn_unstratified_multiclass": _tabpvn_unstratified_multiclass,
     "tabpvn_depth4_affine_auc": _tabpvn_depth4_affine_auc,
     "tabpvn_threshold_rules": _tabpvn_threshold_rules,
