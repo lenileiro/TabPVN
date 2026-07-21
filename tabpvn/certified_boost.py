@@ -1716,6 +1716,8 @@ class AdditiveCertifiedClassifier:
         max_leaves=None,
         best_first_pair=False,
         adaptive_best_first_pair=False,
+        coupled_pair_growth=False,
+        honest_pair_growth=False,
         validation_metric="logloss",
         track_validation_metrics=(),
         track_residual_dynamics=False,
@@ -1738,6 +1740,8 @@ class AdditiveCertifiedClassifier:
         self.max_leaves = None if max_leaves is None else int(max_leaves)
         self.best_first_pair = bool(best_first_pair)
         self.adaptive_best_first_pair = bool(adaptive_best_first_pair)
+        self.coupled_pair_growth = bool(coupled_pair_growth)
+        self.honest_pair_growth = bool(honest_pair_growth)
         self.validation_metric = str(validation_metric)
         self.track_validation_metrics = tuple(str(metric) for metric in track_validation_metrics)
         self.track_residual_dynamics = bool(track_residual_dynamics)
@@ -1840,6 +1844,8 @@ class AdditiveCertifiedClassifier:
             max_leaves=self.max_leaves,
             best_first_pair=self.best_first_pair,
             adaptive_best_first_pair=self.adaptive_best_first_pair,
+            coupled_pair_growth=self.coupled_pair_growth,
+            honest_pair_growth=self.honest_pair_growth,
             validation_metric=self.validation_metric,
             track_validation_metrics=self.track_validation_metrics,
             track_residual_dynamics=self.track_residual_dynamics,
