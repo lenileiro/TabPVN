@@ -42,23 +42,31 @@ def test_automatic_multiclass_fit_stratifies_the_deployed_verifier(monkeypatch):
     assert model.multiclass_architecture_report_["stratified_verifier"] is True
 
 
-def test_automatic_categorical_multiclass_fit_keeps_incumbent_verifier(monkeypatch):
+def test_encoded_categorical_multiclass_fit_enables_numeric_pair_growth(monkeypatch):
     import pandas as pd
 
     X, y = _three_class_table(rows=450)
     frame = pd.DataFrame(X, columns=[f"feature_{index}" for index in range(X.shape[1])])
     frame["category"] = pd.Categorical(np.where(X[:, 0] > 50, "high", "low"))
     model = TabPVN(seed=3)
+
+    def selected_config(features, labels):
+        return model._with_adaptive_multiclass_pair_growth(
+            features,
+            labels,
+            {
+                "rounds": 4,
+                "lr": 0.05,
+                "depth": 2,
+                "leaf": 5,
+                "patience": 2,
+            },
+        )
+
     monkeypatch.setattr(
         model,
         "_auto_tune",
-        lambda _X, _y: {
-            "rounds": 4,
-            "lr": 0.05,
-            "depth": 2,
-            "leaf": 5,
-            "patience": 2,
-        },
+        selected_config,
     )
     monkeypatch.setattr(model, "_auto_target_encoding", lambda _X, _y: False)
 
@@ -76,8 +84,10 @@ def test_automatic_categorical_multiclass_fit_keeps_incumbent_verifier(monkeypat
     pair_report = next(
         row for row in model.booster_selection_report_ if row["name"] == "adaptive_multiclass_pair_growth"
     )
-    assert pair_report["controller_enabled"] is False
-    assert pair_report["reason"] == "categorical_schema"
+    assert model.boost_["adaptive_best_first_pair"] is True
+    assert "coupled_pair_growth" not in model.boost_
+    assert pair_report["controller_enabled"] is True
+    assert pair_report["reason"] in {"verified_residual_pair", "no_verified_residual_pair"}
 
 
 def test_adaptive_pair_growth_is_bounded_to_supported_multiclass_schemas():
@@ -90,8 +100,16 @@ def test_adaptive_pair_growth_is_bounded_to_supported_multiclass_schemas():
     assert selected["max_leaves"] == 24
     assert selected["best_first_pair"] is True
     assert selected["adaptive_best_first_pair"] is True
+    assert "coupled_pair_growth" not in selected
+    high_cardinality_y = np.resize(np.arange(8), len(y))
+    high_cardinality = model._with_adaptive_multiclass_pair_growth(X, high_cardinality_y, base)
+    assert high_cardinality["max_leaves"] == 32
     assert model._with_adaptive_multiclass_pair_growth(X[:399], y[:399], base) == base
-    assert model._with_adaptive_multiclass_pair_growth(np.zeros((450, 129)), y, base) == base
+    encoded_wide = model._with_adaptive_multiclass_pair_growth(np.zeros((450, 360)), y, base)
+    assert encoded_wide["adaptive_best_first_pair"] is True
+    assert model._with_adaptive_multiclass_pair_growth(np.zeros((450, 513)), y, base) == base
+    large_y = np.resize(y, 3_000)
+    assert model._with_adaptive_multiclass_pair_growth(np.zeros((3_000, 360)), large_y, base) == base
     model._cat_groups = ((0, 1),)
     assert model._with_adaptive_multiclass_pair_growth(X, y, base) == base
 
