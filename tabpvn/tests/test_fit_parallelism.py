@@ -7,9 +7,15 @@ import tabpvn.certified_boost as boost_module
 import tabpvn.trees as trees
 from tabpvn.certified_boost import AdditiveCertifiedClassifier
 from tabpvn.trees import (
+    _default_multiclass_feature_fraction,
     _fit_tree_2nd_binned,
+    _fit_tree_softmax_pair_binned,
     _fit_tree_softmax_shared_binned,
+    _flat_leaf_ids,
     _hardest_class_pair,
+    _honest_pair_partition,
+    _reestimate_numeric_newton_leaves,
+    _softmax_pair_newton_terms,
     _tree_pred,
     _tree_pred_rows,
     boost_softmax_predict,
@@ -30,6 +36,14 @@ def test_hardest_class_pair_balances_each_class_and_breaks_ties_stably():
 
     assert _hardest_class_pair(scores, target) == (1, 2)
     assert _hardest_class_pair(np.zeros_like(scores), target) == (0, 1)
+
+
+def test_high_cardinality_feature_search_is_full_only_when_work_is_bounded():
+    assert _default_multiclass_feature_fraction(1_132, 360, 8, True) == 1.0
+    assert _default_multiclass_feature_fraction(10_000, 128, 8, True) == 0.7
+    assert _default_multiclass_feature_fraction(1_132, 360, 7, True) == 0.7
+    assert _default_multiclass_feature_fraction(1_132, 360, 8, False) == 0.7
+    assert _default_multiclass_feature_fraction(100_000, 20, 8, True) == 1.0
 
 
 def test_hard_pair_growth_spends_leaf_budget_only_on_selected_logits(monkeypatch):
@@ -162,6 +176,195 @@ def test_shared_softmax_tree_uses_one_partition_with_centered_vector_leaves():
     np.testing.assert_allclose(np.column_stack([flat[4] for flat in flats]).sum(1), 0.0, atol=1e-14)
     for cls, flat in enumerate(flats):
         np.testing.assert_array_equal(_tree_pred(flat, X), selected_prediction[:, cls])
+
+
+def test_softmax_pair_tree_uses_off_diagonal_curvature_and_opposite_leaves():
+    rng = np.random.default_rng(907)
+    X = rng.normal(size=(500, 7))
+    Xb, edges, bins = trees._prebin(X, 64)
+    raw = rng.normal(size=(len(X), 3))
+    probability = np.exp(raw - raw.max(1, keepdims=True))
+    probability /= probability.sum(1, keepdims=True)
+    target = np.eye(3)[rng.integers(0, 3, size=len(X))]
+    weight = 0.5 + rng.random(len(X))
+    gradient, hessian = _softmax_pair_newton_terms(probability, target, weight, (0, 2))
+
+    direction = np.array([1.0, 0.0, -1.0])
+    expected_hessian = np.empty(len(X))
+    for row, p in enumerate(probability):
+        full_hessian = np.diag(p) - np.outer(p, p)
+        expected_hessian[row] = weight[row] * direction @ full_hessian @ direction
+    np.testing.assert_allclose(hessian, expected_hessian)
+
+    pair_trees, selected_prediction, pair_flats = _fit_tree_softmax_pair_binned(
+        Xb,
+        edges,
+        gradient,
+        hessian,
+        depth=7,
+        min_leaf=12,
+        feats=np.arange(X.shape[1]),
+        lam=1.0,
+        NB=bins,
+        max_leaves=12,
+    )
+
+    for reference, opposite in zip(pair_flats[0][:4], pair_flats[1][:4], strict=False):
+        np.testing.assert_array_equal(reference, opposite)
+    np.testing.assert_array_equal(pair_flats[0][4], -pair_flats[1][4])
+    np.testing.assert_array_equal(selected_prediction[:, 0], -selected_prediction[:, 1])
+    for column, flat in enumerate(pair_flats):
+        np.testing.assert_allclose(_tree_pred(flat, X), selected_prediction[:, column])
+        assert pair_trees[column][0] == "node"
+
+
+def test_honest_newton_refit_preserves_topology_and_uses_only_estimation_rows():
+    rng = np.random.default_rng(905)
+    X = rng.normal(size=(500, 7))
+    Xb, edges, bins = trees._prebin(X[:320], 64)
+    structure_gradient = rng.normal(size=320)
+    structure_hessian = 0.2 + rng.random(320)
+    _tree, _prediction, flat = _fit_tree_2nd_binned(
+        Xb,
+        edges,
+        structure_gradient,
+        structure_hessian,
+        depth=5,
+        min_leaf=12,
+        feats=np.arange(X.shape[1]),
+        lam=1.0,
+        NB=bins,
+    )
+    estimation_X = X[320:]
+    estimation_gradient = rng.normal(size=len(estimation_X))
+    estimation_hessian = 0.2 + rng.random(len(estimation_X))
+
+    honest_tree, honest_flat = _reestimate_numeric_newton_leaves(
+        flat,
+        estimation_X,
+        estimation_gradient,
+        estimation_hessian,
+        lam=1.0,
+    )
+
+    for original, honest in zip(flat[:4], honest_flat[:4], strict=False):
+        np.testing.assert_array_equal(honest, original)
+    leaf_id = _flat_leaf_ids(flat, estimation_X)
+    for leaf in np.flatnonzero(flat[0] < 0):
+        rows = leaf_id == leaf
+        expected = -estimation_gradient[rows].sum() / (estimation_hessian[rows].sum() + 1.0)
+        assert honest_flat[4][leaf] == pytest.approx(expected)
+    np.testing.assert_array_equal(_tree_pred(honest_tree, X), _tree_pred(honest_flat, X))
+
+    selected = np.arange(120) % 3 != 0
+    first = _honest_pair_partition(selected, np.random.default_rng(11), min_leaf=8)
+    second = _honest_pair_partition(selected, np.random.default_rng(11), min_leaf=8)
+    np.testing.assert_array_equal(first[0], second[0])
+    np.testing.assert_array_equal(first[1], second[1])
+    assert not np.any(first[0] & first[1])
+    assert np.all(first[1] == ~first[0])
+
+
+@pytest.mark.parametrize("refit", [False, True])
+def test_adaptive_honest_pair_growth_keeps_scalar_proofs(monkeypatch, refit):
+    rng = np.random.default_rng(910)
+    X = rng.normal(size=(480, 7))
+    y = np.argmax(
+        np.column_stack(
+            [
+                X[:, 0] - 0.4 * X[:, 1],
+                X[:, 1] + X[:, 2] * X[:, 3],
+                -X[:, 0] - X[:, 2] * X[:, 3],
+            ]
+        ),
+        axis=1,
+    )
+    reestimated_rows = []
+    original_reestimate = trees._reestimate_numeric_newton_leaves
+
+    class Tracker:
+        def __init__(self, *_args, **_kwargs):
+            self.records = []
+
+        def observe(self, *_args, **_kwargs):
+            return (0, 1)
+
+    def record_reestimate(flat, features, gradient, hessian, lam):
+        reestimated_rows.append(len(features))
+        return original_reestimate(flat, features, gradient, hessian, lam)
+
+    monkeypatch.setattr(trees, "ResidualDynamicsTracker", Tracker)
+    monkeypatch.setattr(trees, "_reestimate_numeric_newton_leaves", record_reestimate)
+    model = AdditiveCertifiedClassifier(
+        rounds=8,
+        lr=0.05,
+        depth=3,
+        leaf=10,
+        patience=12,
+        refit=refit,
+        max_leaves=8,
+        best_first_pair=True,
+        adaptive_best_first_pair=True,
+        honest_pair_growth=True,
+        seed=20,
+    ).fit(X, y)
+
+    assert reestimated_rows
+    assert all(10 <= rows < len(X) for rows in reestimated_rows)
+    assert any(model.pair_growth_schedule_)
+    assert model.kernel_certify(X, n_trees=18, sample=30)["scores_reproduced"] == 1.0
+
+
+@pytest.mark.parametrize(
+    ("linear_leaf", "refit"),
+    [(False, False), (True, False), (False, True)],
+)
+def test_adaptive_coupled_pair_growth_keeps_scalar_proofs(monkeypatch, linear_leaf, refit):
+    rng = np.random.default_rng(908)
+    X = rng.normal(size=(420, 6))
+    y = np.argmax(
+        np.column_stack(
+            [
+                X[:, 0] - 0.5 * X[:, 1],
+                X[:, 1] + X[:, 2] * X[:, 3],
+                -X[:, 0] - X[:, 2] * X[:, 3],
+            ]
+        ),
+        axis=1,
+    )
+
+    class Tracker:
+        def __init__(self, *_args, **_kwargs):
+            self.records = []
+
+        def observe(self, *_args, **_kwargs):
+            return (0, 1)
+
+    monkeypatch.setattr(trees, "ResidualDynamicsTracker", Tracker)
+    model = AdditiveCertifiedClassifier(
+        rounds=8,
+        lr=0.05,
+        depth=3,
+        leaf=10,
+        patience=12,
+        refit=refit,
+        max_leaves=8,
+        best_first_pair=True,
+        adaptive_best_first_pair=True,
+        coupled_pair_growth=True,
+        linear_leaf=linear_leaf,
+        seed=18,
+    ).fit(X, y)
+
+    active_rounds = [(index, pair) for index, pair in enumerate(model.pair_growth_schedule_) if pair]
+    assert active_rounds
+    for round_index, pair in active_rounds:
+        round_flats = model._flats()[round_index * 3 : (round_index + 1) * 3]
+        first, second = pair
+        for reference, opposite in zip(round_flats[first][:4], round_flats[second][:4], strict=False):
+            np.testing.assert_array_equal(reference, opposite)
+        np.testing.assert_array_equal(round_flats[first][4], -round_flats[second][4])
+    assert model.kernel_certify(X, n_trees=18, sample=30)["scores_reproduced"] == 1.0
 
 
 def test_best_first_newton_tree_honors_leaf_budget_and_flat_routing():
