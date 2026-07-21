@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 import warnings
+from collections import Counter
 from typing import Any, Literal, Self
 
 import numpy as np
@@ -199,6 +200,23 @@ _TOKEN_RE = re.compile(r"[a-z0-9]{2,}")
 
 def _tokenize(value: Any) -> list[str]:
     return _TOKEN_RE.findall(value.lower()) if isinstance(value, str) else []
+
+
+def _looks_like_structured_identifier(series: Any) -> bool:
+    """Return whether a high-cardinality string column contains reusable ID parts."""
+    values = series.dropna().astype(str)
+    if len(values) < 8 or values.nunique() < 8 or values.nunique() / len(values) < 0.5:
+        return False
+    sample = values.sample(min(len(values), 1_000), random_state=0)
+    if sample.str.contains(r"[-_:/]", regex=True).mean() < 0.8:
+        return False
+    documents = [_tokenize(value) for value in sample]
+    token_counts = np.asarray([len(tokens) for tokens in documents], dtype=int)
+    if np.mean((token_counts >= 2) & (token_counts <= 8)) < 0.8:
+        return False
+    frequency = Counter(token for tokens in documents for token in set(tokens))
+    maximum_reusable_frequency = 0.8 * len(documents)
+    return any(2 <= count <= maximum_reusable_frequency for count in frequency.values())
 
 
 class _TextFeaturizer:
@@ -600,7 +618,9 @@ class _Preprocessor:
                     for label in self.target_encoding.get(column, {}).get("labels", [])
                 ]
         text_names = [
-            f"{column}~{token}" for column in self.text_cols for token in self.text_feat[column].vocab
+            (f"{column}__token={token}" if column in self.structured_id_cols else f"{column}~{token}")
+            for column in self.text_cols
+            for token in self.text_feat[column].vocab
         ]
         compression_names = [
             name
@@ -681,6 +701,7 @@ class _Preprocessor:
         )
 
         self.text_cols = []
+        self.structured_id_cols = []
         self.text_feat = {}
         self.cat_cols = []
         for column in (
@@ -691,8 +712,11 @@ class _Preprocessor:
             series = frame[column].dropna().astype(str)
             sample = series.sample(min(len(series), 1000), random_state=0) if len(series) else series
             mean_tokens = float(np.mean([len(_tokenize(value)) for value in sample])) if len(sample) else 0.0
-            if mean_tokens >= 4 and frame[column].nunique(dropna=True) > 20:
+            structured_identifier = _looks_like_structured_identifier(frame[column])
+            if (mean_tokens >= 4 and frame[column].nunique(dropna=True) > 20) or structured_identifier:
                 self.text_cols.append(column)
+                if structured_identifier:
+                    self.structured_id_cols.append(column)
                 max_features = 1200 if y is not None and not self._target_is_classification else 300
                 self.text_feat[column] = _TextFeaturizer(max_features=max_features).fit(
                     frame[column],
@@ -707,6 +731,8 @@ class _Preprocessor:
         self.compression_report = []
         if y is not None and self._target_is_classification and self.compression_evidence_enabled:
             for column in self.text_cols:
+                if column in self.structured_id_cols:
+                    continue
                 try:
                     evidence_map = CompressionEvidenceMap().fit(frame[column].to_numpy(dtype=object), y)
                 except (TypeError, ValueError, FloatingPointError, OverflowError) as error:
