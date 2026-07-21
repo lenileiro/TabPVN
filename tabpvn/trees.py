@@ -17,6 +17,8 @@ import numpy as np
 from tabpvn.residual_dynamics import ResidualDynamicsTracker, hardest_class_pair
 
 _ADAPTIVE_PAIR_PROBE_ROUNDS = 16
+_ADAPTIVE_PAIR_FULL_FEATURE_MAX_WORK = 1_000_000
+_HONEST_PAIR_STRUCTURE_FRACTION = 0.8
 
 # A tree's histogram build is independent across split features.  Above this
 # amount of row-feature work, assigning one feature at a time to Numba workers
@@ -2067,6 +2069,54 @@ def _negate_flat_values(flat):
     return (flat[0], flat[1], flat[2], flat[3], -flat[4])
 
 
+def _numeric_tree_from_flat(flat):
+    """Expose a numeric flat tree through the lazy tuple ABI used by proofs."""
+    feat, threshold, left, right, value = flat
+
+    def to_tuple(node):
+        if feat[node] < 0:
+            return ("leaf", float(value[node]))
+        return (
+            "node",
+            int(feat[node]),
+            float(threshold[node]),
+            to_tuple(int(left[node])),
+            to_tuple(int(right[node])),
+        )
+
+    return _LazyTree(lambda: to_tuple(0))
+
+
+def _reestimate_numeric_newton_leaves(flat, X, gradient, hessian, lam):
+    """Estimate leaf values on rows that did not choose the tree topology."""
+    if flat is None:
+        raise ValueError("honest leaf estimation requires a numeric flat tree")
+    X = np.asarray(X, dtype=float)
+    gradient = np.asarray(gradient, dtype=float)
+    hessian = np.asarray(hessian, dtype=float)
+    if gradient.shape != (len(X),) or hessian.shape != gradient.shape:
+        raise ValueError("honest Newton evidence must align with estimation rows")
+    feat, threshold, left, right, _value = flat
+    leaf_id = _flat_leaf_ids(flat, X)
+    gradient_sum = np.bincount(leaf_id, weights=gradient, minlength=len(feat))
+    hessian_sum = np.bincount(leaf_id, weights=hessian, minlength=len(feat))
+    value = np.zeros(len(feat), dtype=float)
+    leaves = feat < 0
+    value[leaves] = -gradient_sum[leaves] / (hessian_sum[leaves] + float(lam))
+    honest_flat = (feat, threshold, left, right, value)
+    return _numeric_tree_from_flat(honest_flat), honest_flat
+
+
+def _honest_pair_partition(selected, rng, min_leaf):
+    """Rotate disjoint structure and leaf-value rows without changing row sampling."""
+    selected = np.asarray(selected, dtype=bool)
+    structure = selected & (rng.random(len(selected)) < _HONEST_PAIR_STRUCTURE_FRACTION)
+    estimation = ~structure
+    if int(structure.sum()) < 2 * int(min_leaf) or int(estimation.sum()) < int(min_leaf):
+        return selected, None
+    return structure, estimation
+
+
 def _fit_tree_2nd_binned_best_first(
     Xb,
     edges,
@@ -2492,6 +2542,66 @@ def _fit_tree_softmax_shared_binned(
             (feat_out, bink[:nodes].astype(np.int64), left_out, right_out, values[:nodes, cls].astype(float))
         )
     return trees, predictions, flats, binned_flats
+
+
+def _softmax_pair_newton_terms(probability, target, weight, pair):
+    """Exact Newton gradient and curvature along ``score[a] - score[b]``.
+
+    Softmax has off-diagonal Hessian entries ``-p[a] * p[b]``. Restricting a
+    leaf update to ``(+value, -value)`` therefore gives curvature
+    ``p[a] + p[b] - (p[a] - p[b]) ** 2`` rather than the sum of two diagonal
+    one-vs-rest terms.
+    """
+    probability = np.asarray(probability, dtype=float)
+    target = np.asarray(target, dtype=float)
+    weight = np.asarray(weight, dtype=float)
+    first, second = (int(pair[0]), int(pair[1]))
+    if probability.ndim != 2 or target.shape != probability.shape:
+        raise ValueError("softmax pair terms require aligned n-by-K probability and target matrices")
+    if weight.shape != (len(probability),):
+        raise ValueError("softmax pair weights must align with rows")
+    if not (0 <= first < probability.shape[1] and 0 <= second < probability.shape[1]) or first == second:
+        raise ValueError("softmax pair must contain two distinct class indices")
+    pa = probability[:, first]
+    pb = probability[:, second]
+    gradient = weight * ((pa - target[:, first]) - (pb - target[:, second]))
+    hessian = weight * (pa + pb - np.square(pa - pb))
+    return gradient, np.maximum(hessian, 0.0)
+
+
+def _fit_tree_softmax_pair_binned(
+    Xb,
+    edges,
+    gradient,
+    hessian,
+    *,
+    depth,
+    min_leaf,
+    feats,
+    lam,
+    NB,
+    max_leaves,
+):
+    """Fit one shared partition with equal-and-opposite class-pair leaves."""
+    tree, prediction, flat = _fit_tree_2nd_binned(
+        Xb,
+        edges,
+        gradient,
+        hessian,
+        depth=depth,
+        min_leaf=min_leaf,
+        feats=feats,
+        # The pair vector has two non-zero coordinates, so its L2 penalty is
+        # twice the scalar penalty used by an individual class tree.
+        lam=2.0 * float(lam),
+        NB=NB,
+        max_leaves=max_leaves,
+    )
+    return (
+        (tree, _negate_tree_values(tree)),
+        np.column_stack((prediction, -prediction)),
+        (flat, _negate_flat_values(flat)),
+    )
 
 
 _WARMED = False
@@ -3107,6 +3217,23 @@ def _hardest_class_pair(scores, target, sample_weight=None):
     return hardest_class_pair(scores, target, sample_weight)
 
 
+def _default_multiclass_feature_fraction(rows, features, classes, adaptive_best_first_pair):
+    """Default feature fraction for one multiclass boosting round.
+
+    Compact high-cardinality fits inspect every encoded feature because a 70%
+    draw can repeatedly omit rare-class evidence.  The row-feature work bound
+    retains subsampling on large fits, while narrow tables keep their existing
+    full-feature behavior.
+    """
+    rows, features, classes = int(rows), int(features), int(classes)
+    if features < 25:
+        return 1.0
+    high_cardinality_work_is_bounded = bool(
+        adaptive_best_first_pair and classes >= 8 and rows * features <= _ADAPTIVE_PAIR_FULL_FEATURE_MAX_WORK
+    )
+    return 1.0 if high_cardinality_work_is_bounded else 0.7
+
+
 def _binary_probability(margin):
     """P(class zero) from the logit difference ``score_zero - score_one``."""
     return 1.0 / (1.0 + np.exp(-margin))
@@ -3574,6 +3701,8 @@ def reason_boost_softmax(  # noqa: C901 - multiclass boost training loop
     max_leaves=None,
     best_first_pair=False,
     adaptive_best_first_pair=False,
+    coupled_pair_growth=False,
+    honest_pair_growth=False,
     validation_metric="logloss",
     track_validation_metrics=(),
     track_residual_dynamics=False,
@@ -3624,6 +3753,14 @@ def reason_boost_softmax(  # noqa: C901 - multiclass boost training loop
         )
     if adaptive_best_first_pair and not best_first_pair:
         raise ValueError("adaptive_best_first_pair requires best_first_pair")
+    if coupled_pair_growth and not adaptive_best_first_pair:
+        raise ValueError("coupled_pair_growth requires adaptive_best_first_pair")
+    if coupled_pair_growth and (K <= 2 or not second_order or shared_structure or bool(cat_groups)):
+        raise ValueError("coupled_pair_growth requires a numeric, second-order, non-shared multiclass fit")
+    if honest_pair_growth and not adaptive_best_first_pair:
+        raise ValueError("honest_pair_growth requires adaptive_best_first_pair")
+    if honest_pair_growth and coupled_pair_growth:
+        raise ValueError("honest_pair_growth and coupled_pair_growth are alternative pair-tree estimators")
     if track_residual_dynamics and K <= 2:
         raise ValueError("residual-dynamics tracing currently requires a multiclass target")
     use_shared_structure = bool(
@@ -3691,10 +3828,16 @@ def reason_boost_softmax(  # noqa: C901 - multiclass boost training loop
     if sub is None:
         sub = 1.0 if len(fit) < 2500 else 0.7  # adaptive: don't starve small multiclass
     if mf is None:
-        mf = 1.0 if len(numeric_pool) < 25 else 0.7
+        mf = _default_multiclass_feature_fraction(
+            len(X),
+            len(numeric_pool),
+            K,
+            adaptive_best_first_pair,
+        )
     nfeat = min(len(numeric_pool), max(1, int(mf * len(numeric_pool))))
     ncat = min(len(cat_groups), max(1, int(mf * len(cat_groups)))) if cat_groups else 0
     rm = np.random.default_rng(seed * 17 + 1)
+    honest_rm = np.random.default_rng(seed * 65_537 + 17)
     Xbf, edges, NB = _prebin(Xf, nbins) if second_order else (None, None, None)
     cnt = np.bincount(yf, weights=fit_source_weight, minlength=K).astype(float)
     base = np.log(np.clip(cnt / cnt.sum(), 1e-6, 1))
@@ -3799,10 +3942,11 @@ def reason_boost_softmax(  # noqa: C901 - multiclass boost training loop
         else None
     )
 
-    def _map_k(fn, tree_parallel_hist):
+    def _map_k(fn, tree_parallel_hist, class_indices=None):
+        class_indices = range(K) if class_indices is None else class_indices
         if _pool is not None and not tree_parallel_hist:
-            return list(_pool.map(fn, range(K)))
-        return [fn(k) for k in range(K)]
+            return list(_pool.map(fn, class_indices))
+        return [fn(k) for k in class_indices]
 
     try:
         for round_idx in range(rounds):
@@ -3822,6 +3966,9 @@ def reason_boost_softmax(  # noqa: C901 - multiclass boost training loop
                 hard_pair = ()
             round_update_v = np.zeros_like(Fv) if dynamics_tracker is not None else None
             s = rm.random(len(fit)) < sub
+            honest_structure, honest_estimation = s, None
+            if honest_pair_growth and hard_pair:
+                honest_structure, honest_estimation = _honest_pair_partition(s, honest_rm, min_leaf)
             feats = rm.choice(numeric_pool, nfeat, replace=False)
             cat_feats = rm.choice(len(cat_groups), ncat, replace=False) if ncat else np.empty(0, np.int64)
             rest = ~s
@@ -3866,6 +4013,44 @@ def reason_boost_softmax(  # noqa: C901 - multiclass boost training loop
                     break
                 continue
 
+            coupled_results = []
+            independent_classes = list(range(K))
+            if coupled_pair_growth and hard_pair:
+                first, second = (int(hard_pair[0]), int(hard_pair[1]))
+                pair_gradient, pair_hessian = _softmax_pair_newton_terms(
+                    pf,
+                    Yf,
+                    wf,
+                    (first, second),
+                )
+                pair_depth = max(int(depth), min(12, int(max_leaves) - 1))
+                pair_trees, pair_prediction, pair_flats = _fit_tree_softmax_pair_binned(
+                    Xbs,
+                    edges,
+                    pair_gradient[s],
+                    pair_hessian[s],
+                    depth=pair_depth,
+                    min_leaf=min_leaf,
+                    feats=feats,
+                    lam=lam,
+                    NB=NB,
+                    max_leaves=max_leaves,
+                )
+                for pair_column, k in enumerate((first, second)):
+                    flat = pair_flats[pair_column]
+                    coupled_results.append(
+                        (
+                            k,
+                            pair_trees[pair_column],
+                            flat,
+                            pair_prediction[:, pair_column],
+                            (_tree_pred(flat, Xf_rest) if has_rest else None),
+                            None,
+                            _tree_pred(flat, Xv),
+                        )
+                    )
+                independent_classes = [k for k in range(K) if k not in (first, second)]
+
             def _grow(
                 k,
                 pf=pf,
@@ -3880,24 +4065,30 @@ def reason_boost_softmax(  # noqa: C901 - multiclass boost training loop
                 Xfs=Xfs,
                 round_idx=round_idx,
                 hard_pair=hard_pair,
+                honest_structure=honest_structure,
+                honest_estimation=honest_estimation,
             ):  # pure per-class work over an immutable snapshot of the round
+                pair_member = hard_pair is not None and k in hard_pair
                 gk = wf * (pf[:, k] - Yf[:, k])
                 hk = wf * pf[:, k] * (1 - pf[:, k])  # class-weighted grad/hess
                 if second_order:  # Hessian-weighted binned splits per class
-                    pair_member = hard_pair is not None and k in hard_pair
+                    honest_pair_member = pair_member and honest_estimation is not None
+                    tree_rows = honest_structure if honest_pair_member else s
+                    tree_Xb = Xbf[tree_rows] if honest_pair_member else Xbs
+                    tree_cat_codes = catf[tree_rows] if honest_pair_member else catfs
                     tree_depth = max(int(depth), min(12, int(max_leaves) - 1)) if pair_member else depth
                     tree_max_leaves = max_leaves if hard_pair is None or pair_member else None
                     t, pk, flat = _fit_tree_2nd_binned(
-                        Xbs,
+                        tree_Xb,
                         edges,
-                        gk[s],
-                        hk[s],
+                        gk[tree_rows],
+                        hk[tree_rows],
                         tree_depth,
                         min_leaf,
                         feats,
                         lam,
                         NB,
-                        cat_codes=catfs,
+                        cat_codes=tree_cat_codes,
                         cat_groups=cat_groups,
                         cat_feats=cat_feats,
                         honest_categorical=honest_categorical,
@@ -3905,6 +4096,15 @@ def reason_boost_softmax(  # noqa: C901 - multiclass boost training loop
                         parallel_hist=tree_parallel_hist,
                         max_leaves=tree_max_leaves,
                     )
+                    if honest_pair_member:
+                        t, flat = _reestimate_numeric_newton_leaves(
+                            flat,
+                            Xf[honest_estimation],
+                            gk[honest_estimation],
+                            hk[honest_estimation],
+                            lam,
+                        )
+                        return k, t, flat, None, None, _tree_pred(flat, Xf), _tree_pred(flat, Xv)
                     if (
                         linear_leaf
                     ):  # logit-ridge leaves (residual −gk/hk, weight hk); affine -> predict all rows
@@ -3918,8 +4118,10 @@ def reason_boost_softmax(  # noqa: C901 - multiclass boost training loop
                 flat = _flatten_tree(t)
                 return k, t, flat, None, None, _tree_pred(flat, Xf), _tree_pred(flat, Xv)
 
-            for k, t, flat, pk, drest, dfull, dv in _map_k(_grow, tree_parallel_hist):
-                if second_order and not linear_leaf:
+            round_results = _map_k(_grow, tree_parallel_hist, independent_classes)
+            round_results.extend(coupled_results)
+            for k, t, flat, pk, drest, dfull, dv in sorted(round_results, key=lambda result: result[0]):
+                if second_order and pk is not None:
                     Ff[s, k] += lr * pk  # subsample rows free (leaf values from build)
                     if drest is not None:
                         Ff[rest, k] += lr * drest
@@ -3991,6 +4193,7 @@ def reason_boost_softmax(  # noqa: C901 - multiclass boost training loop
         if source_weight is not None:
             w2 = w2 * source_weight
         rm2 = np.random.default_rng(seed * 17 + 2)
+        honest_rm2 = np.random.default_rng(seed * 65_537 + 18)
         trees, flats = [], []
         deployed_growth_schedule = []
         for round_idx in range(rounds_kept):
@@ -4007,6 +4210,9 @@ def reason_boost_softmax(  # noqa: C901 - multiclass boost training loop
             if adaptive_best_first_pair:
                 deployed_growth_schedule.append(tuple(hard_pair) if hard_pair else ())
             s = rm2.random(len(yi)) < sub
+            honest_structure, honest_estimation = s, None
+            if honest_pair_growth and hard_pair:
+                honest_structure, honest_estimation = _honest_pair_partition(s, honest_rm2, min_leaf)
             feats = rm2.choice(numeric_pool, nfeat, replace=False)
             cat_feats = rm2.choice(len(cat_groups), ncat, replace=False) if ncat else np.empty(0, np.int64)
             rest = ~s
@@ -4042,6 +4248,43 @@ def reason_boost_softmax(  # noqa: C901 - multiclass boost training loop
                     flats.append(flat)
                 continue
 
+            coupled_results = []
+            independent_classes = list(range(K))
+            if coupled_pair_growth and hard_pair:
+                first, second = (int(hard_pair[0]), int(hard_pair[1]))
+                pair_gradient, pair_hessian = _softmax_pair_newton_terms(
+                    p,
+                    Y,
+                    w2,
+                    (first, second),
+                )
+                pair_depth = max(int(depth), min(12, int(max_leaves) - 1))
+                pair_trees, pair_prediction, pair_flats = _fit_tree_softmax_pair_binned(
+                    Xbs,
+                    edges_all,
+                    pair_gradient[s],
+                    pair_hessian[s],
+                    depth=pair_depth,
+                    min_leaf=min_leaf,
+                    feats=feats,
+                    lam=lam,
+                    NB=NB_all,
+                    max_leaves=max_leaves,
+                )
+                for pair_column, k in enumerate((first, second)):
+                    flat = pair_flats[pair_column]
+                    coupled_results.append(
+                        (
+                            k,
+                            pair_trees[pair_column],
+                            flat,
+                            pair_prediction[:, pair_column],
+                            (_tree_pred(flat, Xrest) if has_rest else None),
+                            None,
+                        )
+                    )
+                independent_classes = [k for k in range(K) if k not in (first, second)]
+
             def _grow_r(
                 k,
                 p=p,
@@ -4056,24 +4299,30 @@ def reason_boost_softmax(  # noqa: C901 - multiclass boost training loop
                 Xs=Xs,
                 round_idx=round_idx,
                 hard_pair=hard_pair,
+                honest_structure=honest_structure,
+                honest_estimation=honest_estimation,
             ):
+                pair_member = hard_pair is not None and k in hard_pair
                 gk = w2 * (p[:, k] - Y[:, k])
                 hk = w2 * p[:, k] * (1 - p[:, k])
                 if second_order:
-                    pair_member = hard_pair is not None and k in hard_pair
+                    honest_pair_member = pair_member and honest_estimation is not None
+                    tree_rows = honest_structure if honest_pair_member else s
+                    tree_Xb = Xb_all[tree_rows] if honest_pair_member else Xbs
+                    tree_cat_codes = cat_codes[tree_rows] if honest_pair_member else catfs
                     tree_depth = max(int(depth), min(12, int(max_leaves) - 1)) if pair_member else depth
                     tree_max_leaves = max_leaves if hard_pair is None or pair_member else None
                     t, pk, flat = _fit_tree_2nd_binned(
-                        Xbs,
+                        tree_Xb,
                         edges_all,
-                        gk[s],
-                        hk[s],
+                        gk[tree_rows],
+                        hk[tree_rows],
                         tree_depth,
                         min_leaf,
                         feats,
                         lam,
                         NB_all,
-                        cat_codes=catfs,
+                        cat_codes=tree_cat_codes,
                         cat_groups=cat_groups,
                         cat_feats=cat_feats,
                         honest_categorical=honest_categorical,
@@ -4081,6 +4330,15 @@ def reason_boost_softmax(  # noqa: C901 - multiclass boost training loop
                         parallel_hist=tree_parallel_hist,
                         max_leaves=tree_max_leaves,
                     )
+                    if honest_pair_member:
+                        t, flat = _reestimate_numeric_newton_leaves(
+                            flat,
+                            X[honest_estimation],
+                            gk[honest_estimation],
+                            hk[honest_estimation],
+                            lam,
+                        )
+                        return k, t, flat, None, None, _tree_pred(flat, X)
                     if linear_leaf:
                         t = _fit_leaf_lin(t, Xs, -gk[s] / hk[s], hk[s], lam_lin, lam)
                         return k, t, flat, None, None, _affine_tree_pred(t, X)
@@ -4092,8 +4350,10 @@ def reason_boost_softmax(  # noqa: C901 - multiclass boost training loop
                 flat = _flatten_tree(t)
                 return k, t, flat, None, None, _tree_pred(flat, X)
 
-            for k, t, flat, pk, drest, dfull in _map_k(_grow_r, tree_parallel_hist):
-                if second_order and not linear_leaf:
+            round_results = _map_k(_grow_r, tree_parallel_hist, independent_classes)
+            round_results.extend(coupled_results)
+            for k, t, flat, pk, drest, dfull in sorted(round_results, key=lambda result: result[0]):
+                if second_order and pk is not None:
                     F[s, k] += lr * pk  # subsample rows free
                     if drest is not None:
                         F[rest, k] += lr * drest
