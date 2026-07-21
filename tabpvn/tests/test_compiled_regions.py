@@ -178,3 +178,38 @@ def test_postings_category_evidence_matches_dense_atomic_fact_reference():
     assert np.allclose(actual.sum(1), 1.0)
     assert memory.index_report()["postings"] == n * len(widths)
     assert memory.index_report()["read_backend"] == "dense"
+
+
+def test_postings_category_pair_evidence_matches_dense_reference():
+    rng = np.random.default_rng(17)
+    widths = (3, 4, 2, 3)
+    n = 240
+    codes = [rng.integers(0, width, size=n) for width in widths]
+    blocks = []
+    groups = []
+    start = 0
+    for code, width in zip(codes, widths, strict=False):
+        block = np.zeros((n, width), float)
+        block[np.arange(n), code] = 1.0
+        blocks.append(block)
+        groups.append(tuple(range(start, start + width)))
+        start += width
+    X = np.concatenate(blocks, axis=1)
+    y = np.bitwise_xor(codes[0] % 2, codes[1] % 2)
+    memory = _CategoricalEvidenceMemory(
+        X,
+        y,
+        [0, 1],
+        groups,
+        seed=9,
+        metric="rarity_plus_label_information_pairs",
+    )
+
+    query = X[:32].copy()
+    query[0] = 0.0
+    codes = memory._codes(query)
+    expected = _dense_evidence_proba(memory, query)
+    actual = memory._indexed_proba(codes)
+
+    assert memory.pair_facts
+    np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
