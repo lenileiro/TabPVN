@@ -29,6 +29,7 @@ sufficient-reason), recourse, certify (soundness), explain, rules; relational ad
 from __future__ import annotations
 
 import os
+from itertools import combinations
 from typing import Any
 
 import numpy as np
@@ -124,7 +125,23 @@ _MULTICLASS_RULE_MIN_FOLD_GAIN = 0.001
 _MULTICLASS_RULE_MIN_MEAN_GAIN = 0.002
 _MULTICLASS_HEAD_SCREEN_MIN_FOLD_GAIN = -0.002
 _MULTICLASS_ADAPTIVE_PAIR_MAX_FEATURES = 128
+_MULTICLASS_ADAPTIVE_PAIR_MAX_WIDE_FEATURES = 512
+_MULTICLASS_ADAPTIVE_PAIR_MAX_WIDE_WORK = 1_000_000
 _MULTICLASS_ADAPTIVE_PAIR_MAX_LEAVES = 24
+# Eight or more competing logits can exhaust the 24-slot pair topology. Keep
+# lower-cardinality fits bit-identical and cap the wider topology at 32 leaves.
+_MULTICLASS_ADAPTIVE_PAIR_HIGH_CLASS_COUNT = 8
+_MULTICLASS_ADAPTIVE_PAIR_HIGH_CLASS_LEAVES = 32
+
+
+def _adaptive_multiclass_pair_work_is_bounded(rows, features):
+    """Admit compact encoded-wide tables without widening large-data cost."""
+    rows, features = int(rows), int(features)
+    return features <= _MULTICLASS_ADAPTIVE_PAIR_MAX_FEATURES or (
+        features <= _MULTICLASS_ADAPTIVE_PAIR_MAX_WIDE_FEATURES
+        and rows * features <= _MULTICLASS_ADAPTIVE_PAIR_MAX_WIDE_WORK
+    )
+
 
 # A dominant multiclass prior can bury an OOF-admitted minority rank signal in
 # the softmax denominator. A fixed geometric half-step toward a uniform prior
@@ -183,6 +200,16 @@ _LINEAR_LEAF_GATE_MAX_N = 50_000
 # learned embedding. Its OOF gate is useful in the small-table regime; above
 # this cap the quadratic category-overlap read is not a sensible default cost.
 _CATEGORY_MEMORY_MAX_N = 2_500
+_CATEGORY_MEMORY_METRICS = (
+    "rarity",
+    "rarity_plus_label_information",
+    "rarity_plus_label_information_pairs",
+)
+_CATEGORY_MEMORY_INFORMATION_STRENGTH = 2.0
+_CATEGORY_MEMORY_PAIR_INFORMATION_STRENGTH = 4.0
+_CATEGORY_MEMORY_PAIR_FOCUS_GROUPS = 16
+_CATEGORY_MEMORY_PAIR_FAMILIES = 24
+_CATEGORY_MEMORY_PAIR_MAX_CARDINALITY = 4_096
 
 # Count tables are linear in rows and bounded in category-pair families, so the
 # posterior challenger can reuse the existing small-table OOF models throughout
@@ -599,28 +626,37 @@ class _SmoothKNN:
 class _CategoricalEvidenceMemory:
     """Local class evidence from exact overlaps of atomic one-hot categories.
 
-    Every edge is a finite conjunction of raw category facts. Its weight is the
-    sum of the facts' information content, so common levels cannot dominate a
-    rare but discriminating agreement. A bounded adaptive neighbourhood makes
-    the read local; class-prior normalization keeps the vote symmetric for
-    macro ranking on imbalanced multiclass data. This is an auxiliary ranker:
-    ``_preserve_certified_class`` keeps the additive booster's proof-carrying
-    decision unchanged.
+    Every edge is a finite conjunction of raw category facts. Its base weight
+    is category surprisal, so common levels cannot dominate a rare agreement.
+    The OOF gate may instead select a support-discounted, Dirichlet-smoothed KL
+    multiplier that emphasizes facts carrying label information. It may also
+    admit a bounded set of category-pair facts whose joint label information
+    exceeds both atomic facts. A bounded adaptive neighbourhood makes the read
+    local; class-prior normalization keeps the vote symmetric for macro ranking
+    on imbalanced multiclass data.
+    This is an auxiliary ranker: ``_preserve_certified_class`` keeps the
+    additive booster's proof-carrying decision unchanged.
     """
 
-    def __init__(self, X, y, classes, groups, seed=0):
+    def __init__(self, X, y, classes, groups, seed=0, metric="rarity"):
+        if metric not in _CATEGORY_MEMORY_METRICS:
+            raise ValueError(f"categorical evidence metric must be one of {_CATEGORY_MEMORY_METRICS}")
         self.groups = tuple(tuple(int(j) for j in group) for group in groups)
         self.classes = list(classes)
         self._class_index = {c: i for i, c in enumerate(self.classes)}
         self.yidx = np.array([self._class_index[v] for v in np.asarray(y)])
         self.codes = self._codes(X)
         self.n, self.C = len(self.yidx), len(self.classes)
+        self.prior = np.bincount(self.yidx, minlength=self.C).astype(float) / self.n
         self.k = min(self.n - 1, max(2, int(np.ceil(self.n**0.5))))
         self.idf = []
         for group_idx, group in enumerate(self.groups):
             known = self.codes[:, group_idx]
             counts = np.bincount(known[known >= 0], minlength=len(group)).astype(float)
             self.idf.append(np.log((self.n + 1.0) / (counts + 1.0)) + 1.0)
+        self.metric = str(metric)
+        self.fact_weights = self._fact_weights()
+        self.pair_facts = self._pair_facts()
         # Static inverted index over the raw one-hot facts.  A query only
         # touches rows that agree on at least one category instead of building
         # a query-by-training score matrix.  The index preserves the exact
@@ -632,8 +668,93 @@ class _CategoricalEvidenceMemory:
             )
             for group_idx, group in enumerate(self.groups)
         )
-        self.prior = np.bincount(self.yidx, minlength=self.C).astype(float) / self.n
         self.temp = self._local_temperature(seed)
+
+    def _label_information(self, known, cardinality):
+        """Support-discounted level KL and aggregate finite-table information."""
+        known = np.asarray(known, dtype=np.int64)
+        counts = np.zeros((int(cardinality), self.C), dtype=float)
+        valid = known >= 0
+        np.add.at(counts, (known[valid], self.yidx[valid]), 1.0)
+        support = counts.sum(1)
+        posterior = (counts + self.C * self.prior[None, :]) / (support[:, None] + self.C)
+        divergence = np.sum(
+            posterior
+            * (np.log(np.maximum(posterior, 1e-12)) - np.log(np.maximum(self.prior[None, :], 1e-12))),
+            axis=1,
+        )
+        information = support / (support + self.C) * np.sqrt(np.maximum(divergence, 0.0))
+        aggregate = float(np.sum((support / self.n) * divergence))
+        return information, aggregate, support
+
+    def _fact_weights(self):
+        """Return rarity weights, optionally strengthened by finite label evidence."""
+        if self.metric == "rarity":
+            self.level_information = ()
+            self.group_information = ()
+            return tuple(weight.copy() for weight in self.idf)
+        weights, level_information, group_information = [], [], []
+        for group_idx, rarity in enumerate(self.idf):
+            information, aggregate, _support = self._label_information(
+                self.codes[:, group_idx],
+                len(rarity),
+            )
+            weights.append(rarity * (1.0 + _CATEGORY_MEMORY_INFORMATION_STRENGTH * information))
+            level_information.append(information)
+            group_information.append(aggregate)
+        self.level_information = tuple(level_information)
+        self.group_information = tuple(group_information)
+        return tuple(weights)
+
+    def _pair_facts(self):
+        """Compile the strongest support-bounded excess-information pair facts."""
+        if self.metric != "rarity_plus_label_information_pairs" or len(self.groups) < 2:
+            return ()
+        focus = sorted(
+            range(len(self.groups)),
+            key=lambda group: (-self.group_information[group], group),
+        )[:_CATEGORY_MEMORY_PAIR_FOCUS_GROUPS]
+        candidates = []
+        for first, second in combinations(focus, 2):
+            width_second = len(self.groups[second])
+            cardinality = len(self.groups[first]) * width_second
+            if cardinality > _CATEGORY_MEMORY_PAIR_MAX_CARDINALITY:
+                continue
+            first_code = self.codes[:, first].astype(np.int64)
+            second_code = self.codes[:, second].astype(np.int64)
+            valid = (first_code >= 0) & (second_code >= 0)
+            joint_code = np.full(self.n, -1, dtype=np.int32)
+            joint_code[valid] = first_code[valid] * width_second + second_code[valid]
+            joint_information, aggregate, support = self._label_information(
+                joint_code,
+                cardinality,
+            )
+            first_level = np.arange(cardinality) // width_second
+            second_level = np.arange(cardinality) % width_second
+            parent_information = np.maximum(
+                self.level_information[first][first_level],
+                self.level_information[second][second_level],
+            )
+            excess = np.maximum(joint_information - parent_information, 0.0)
+            rarity = np.log((self.n + 1.0) / (support + 1.0)) + 1.0
+            weights = _CATEGORY_MEMORY_PAIR_INFORMATION_STRENGTH * rarity * excess
+            candidates.append(
+                {
+                    "groups": (int(first), int(second)),
+                    "width_second": int(width_second),
+                    "train_codes": joint_code,
+                    "weights": weights,
+                    "information": aggregate,
+                }
+            )
+        candidates.sort(key=lambda pair: (-pair["information"], pair["groups"]))
+        selected = candidates[:_CATEGORY_MEMORY_PAIR_FAMILIES]
+        for pair in selected:
+            pair["postings"] = tuple(
+                np.flatnonzero(pair["train_codes"] == level).astype(np.int32, copy=False)
+                for level in range(len(pair["weights"]))
+            )
+        return tuple(selected)
 
     def _codes(self, X):
         X = np.asarray(X, float)
@@ -657,7 +778,17 @@ class _CategoricalEvidenceMemory:
             query = query_codes[:, group_idx]
             known = query[:, None] >= 0
             same = query[:, None] == self.codes[None, :, group_idx]
-            score += (known & same) * self.idf[group_idx][np.maximum(query, 0), None]
+            score += (known & same) * self.fact_weights[group_idx][np.maximum(query, 0), None]
+        for pair in self.pair_facts:
+            first, second = pair["groups"]
+            first_code = query_codes[:, first].astype(np.int64)
+            second_code = query_codes[:, second].astype(np.int64)
+            valid = (first_code >= 0) & (second_code >= 0)
+            joint_code = np.full(len(query_codes), -1, dtype=np.int64)
+            joint_code[valid] = first_code[valid] * pair["width_second"] + second_code[valid]
+            safe_code = np.maximum(joint_code, 0)
+            same = valid[:, None] & (joint_code[:, None] == pair["train_codes"][None, :])
+            score += same * pair["weights"][safe_code, None]
         return score
 
     def _matching_scores(self, query_code):
@@ -669,7 +800,21 @@ class _CategoricalEvidenceMemory:
             posting = self.postings[group_idx][int(level)]
             if len(posting):
                 ids.append(posting)
-                weights.append(np.full(len(posting), self.idf[group_idx][int(level)], dtype=float))
+                weights.append(np.full(len(posting), self.fact_weights[group_idx][int(level)], dtype=float))
+        for pair in self.pair_facts:
+            first, second = pair["groups"]
+            first_level = int(query_code[first])
+            second_level = int(query_code[second])
+            if first_level < 0 or second_level < 0:
+                continue
+            joint_level = first_level * pair["width_second"] + second_level
+            if joint_level >= len(pair["postings"]):
+                continue
+            posting = pair["postings"][joint_level]
+            weight = float(pair["weights"][joint_level])
+            if len(posting) and weight > 0.0:
+                ids.append(posting)
+                weights.append(np.full(len(posting), weight, dtype=float))
         if not ids:
             return np.empty(0, np.int32), np.empty(0, float)
         ids = np.concatenate(ids)
@@ -786,7 +931,29 @@ class _CategoricalEvidenceMemory:
 
     def index_report(self):
         """Static evidence-index size for fit reports and profiling."""
+        pair_families = [
+            {
+                "groups": list(pair["groups"]),
+                "information": float(pair["information"]),
+                "active_patterns": int(np.count_nonzero(pair["weights"])),
+            }
+            for pair in self.pair_facts
+        ]
         return {
+            "metric": self.metric,
+            "label_information_strength": (
+                _CATEGORY_MEMORY_INFORMATION_STRENGTH if self.metric != "rarity" else 0.0
+            ),
+            "pair_information_strength": (
+                _CATEGORY_MEMORY_PAIR_INFORMATION_STRENGTH
+                if self.metric == "rarity_plus_label_information_pairs"
+                else 0.0
+            ),
+            "pair_cardinality_limit": _CATEGORY_MEMORY_PAIR_MAX_CARDINALITY,
+            "pair_families": pair_families,
+            "pair_postings": int(
+                sum(len(posting) for pair in self.pair_facts for posting in pair["postings"])
+            ),
             "groups": len(self.groups),
             "postings": int(sum(len(posting) for group in self.postings for posting in group)),
             "training_rows": int(self.n),
@@ -1201,6 +1368,7 @@ class TabPVN:
         self.booster_selection_report_ = []
         self.search_allocation_report_ = []
         self.category_memory_report_ = []
+        self._category_memory_metric = "rarity"
         self.category_posterior_report_ = []
         self.numeric_interval_report_ = []
         self.affine_rank_report_ = []
@@ -1779,6 +1947,7 @@ class TabPVN:
         self.target_encoding_report_ = []
         self.target_encoding_variant_ = "none"
         self.category_memory_report_ = []
+        self._category_memory_metric = "rarity"
         self.category_posterior_report_ = []
         self.numeric_interval_report_ = []
         self.affine_rank_report_ = []
@@ -2097,13 +2266,10 @@ class TabPVN:
                     reason = "verified_residual_pair" if active_rounds else "no_verified_residual_pair"
                 elif len(y) < _MULTICLASS_RULE_GATE_MIN_ROWS:
                     reason = "insufficient_verifier_rows"
-                elif self.n_input_features_ > _MULTICLASS_ADAPTIVE_PAIR_MAX_FEATURES:
-                    reason = "wide_schema"
-                elif self._cat_groups or (
-                    self._prep is not None
-                    and (getattr(self._prep, "cat_cols", ()) or getattr(self._prep, "text_cols", ()))
-                ):
-                    reason = "categorical_schema"
+                elif not _adaptive_multiclass_pair_work_is_bounded(len(y), self.n_input_features_):
+                    reason = "wide_large_schema"
+                elif self._cat_groups:
+                    reason = "native_categorical_schema"
                 else:
                     reason = "controller_not_eligible"
                 self.booster_selection_report_.append(
@@ -2219,9 +2385,17 @@ class TabPVN:
                 w = self._category_memory_gate(X, y, precomp=_oof)
                 if w > 0:
                     self._category_memory = _CategoricalEvidenceMemory(
-                        X, y, self._pred.classes_, _onehot_groups(self._prep), seed=self.seed
+                        X,
+                        y,
+                        self._pred.classes_,
+                        _onehot_groups(self._prep),
+                        seed=self.seed,
+                        metric=self._category_memory_metric,
                     )
                     self._category_memory_w = w
+                    self.category_memory_report_[-1]["deployed_evidence"] = (
+                        self._category_memory.index_report()
+                    )
                     if self._category_memory_oof_proba is not None:
                         blended = self._category_memory_oof_proba
                         labels = np.asarray(self._pred.classes_)[blended.argmax(1)]
@@ -3400,6 +3574,8 @@ class TabPVN:
                         "max_leaves",
                         "best_first_pair",
                         "adaptive_best_first_pair",
+                        "coupled_pair_growth",
+                        "honest_pair_growth",
                         "allowed",
                     }
                     and v is not None
@@ -3561,6 +3737,7 @@ class TabPVN:
         """
         groups = _onehot_groups(self._prep)
         self._category_memory_oof_proba = None
+        self._category_memory_metric = "rarity"
         self.category_memory_report_ = [{"name": "categorical_evidence", "selected": False}]
         if (
             precomp is None
@@ -3584,43 +3761,105 @@ class TabPVN:
         if getattr(self, "_smooth_oof_proba", None) is not None:
             base = self._smooth_oof_proba
         try:
-            memory = np.zeros_like(base)
-            params = []
+            memories = {metric: np.zeros_like(base) for metric in _CATEGORY_MEMORY_METRICS}
+            parameters = {metric: [] for metric in _CATEGORY_MEMORY_METRICS}
             for tri, vai in splits:
-                member = _CategoricalEvidenceMemory(X[tri], y[tri], classes, groups, seed=self.seed)
-                memory[vai] = member.proba(X[vai])
-                params.append({"k": member.k, "temperature": round(member.temp, 6)})
+                for metric in _CATEGORY_MEMORY_METRICS:
+                    member = _CategoricalEvidenceMemory(
+                        X[tri],
+                        y[tri],
+                        classes,
+                        groups,
+                        seed=self.seed,
+                        metric=metric,
+                    )
+                    memories[metric][vai] = member.proba(X[vai])
+                    parameters[metric].append(
+                        {
+                            "metric": metric,
+                            "k": member.k,
+                            "temperature": round(member.temp, 6),
+                            "pair_families": len(getattr(member, "pair_facts", ())),
+                            "active_pair_patterns": int(
+                                sum(
+                                    np.count_nonzero(pair["weights"])
+                                    for pair in getattr(member, "pair_facts", ())
+                                )
+                            ),
+                        }
+                    )
             base_score = _classification_rank_score(yi[evidence_rows], base[evidence_rows])
             base_fold = np.array([_classification_rank_score(yi[vai], base[vai]) for _tri, vai in splits])
-            best = (base_score, 0.0, np.zeros(len(splits)), base)
-            for weight in (0.1, 0.2, 0.3, 0.4, 0.5):
-                blended = _preserve_certified_class(base, (1.0 - weight) * base + weight * memory)
-                score = _classification_rank_score(yi[evidence_rows], blended[evidence_rows])
-                fold_delta = np.array(
-                    [
-                        _classification_rank_score(yi[vai], blended[vai]) - base_fold[i]
-                        for i, (_tri, vai) in enumerate(splits)
-                    ]
-                )
-                if score > best[0]:
-                    best = (score, weight, fold_delta, blended)
+            best = {
+                "score": base_score,
+                "weight": 0.0,
+                "fold_delta": np.zeros(len(splits)),
+                "blend": base,
+                "metric": "rarity",
+            }
+            evaluations = []
+            for metric, memory in memories.items():
+                for weight in (0.1, 0.2, 0.3, 0.4, 0.5):
+                    blended = _preserve_certified_class(
+                        base,
+                        (1.0 - weight) * base + weight * memory,
+                    )
+                    score = _classification_rank_score(yi[evidence_rows], blended[evidence_rows])
+                    fold_delta = np.array(
+                        [
+                            _classification_rank_score(yi[vai], blended[vai]) - base_fold[i]
+                            for i, (_tri, vai) in enumerate(splits)
+                        ]
+                    )
+                    evaluations.append(
+                        {
+                            "metric": metric,
+                            "weight": float(weight),
+                            "oof_rank_auc": float(score),
+                            "fold_auc_delta": [float(value) for value in fold_delta],
+                        }
+                    )
+                    if score > best["score"]:
+                        best = {
+                            "score": score,
+                            "weight": weight,
+                            "fold_delta": fold_delta,
+                            "blend": blended,
+                            "metric": metric,
+                        }
         except Exception:
             return 0.0
-        selected = bool(best[1] > 0.0 and best[0] > base_score + 0.003 and np.all(best[2] > 0.0))
+        selected = bool(
+            best["weight"] > 0.0 and best["score"] > base_score + 0.003 and np.all(best["fold_delta"] > 0.0)
+        )
         self.category_memory_report_ = [
             {"name": "certified_boost", "oof_rank_auc": float(base_score), "selected": not selected},
             {
                 "name": "categorical_evidence",
-                "oof_rank_auc": float(best[0]),
-                "fold_auc_delta": [float(value) for value in best[2]],
-                "weight": float(best[1]),
-                "parameters": params,
+                "oof_rank_auc": float(best["score"]),
+                "fold_auc_delta": [float(value) for value in best["fold_delta"]],
+                "weight": float(best["weight"]),
+                "metric": best["metric"],
+                "label_information_strength": (
+                    _CATEGORY_MEMORY_INFORMATION_STRENGTH if best["metric"] != "rarity" else 0.0
+                ),
+                "pair_information_strength": (
+                    _CATEGORY_MEMORY_PAIR_INFORMATION_STRENGTH
+                    if best["metric"] == "rarity_plus_label_information_pairs"
+                    else 0.0
+                ),
+                "pair_focus_groups": _CATEGORY_MEMORY_PAIR_FOCUS_GROUPS,
+                "pair_family_limit": _CATEGORY_MEMORY_PAIR_FAMILIES,
+                "pair_cardinality_limit": _CATEGORY_MEMORY_PAIR_MAX_CARDINALITY,
+                "parameters": parameters[best["metric"]],
+                "candidates": evaluations,
                 "selected": selected,
             },
         ]
         if selected:
-            self._category_memory_oof_proba = best[3]
-        return float(best[1]) if selected else 0.0
+            self._category_memory_metric = best["metric"]
+            self._category_memory_oof_proba = best["blend"]
+        return float(best["weight"]) if selected else 0.0
 
     def _category_posterior_gate(self, X, y, precomp):
         """Admit categorical evidence with the authority its OOF result earned.
@@ -4265,6 +4504,8 @@ class TabPVN:
                 "max_leaves",
                 "best_first_pair",
                 "adaptive_best_first_pair",
+                "coupled_pair_growth",
+                "honest_pair_growth",
                 "allowed",
             }
             and v is not None
@@ -4414,6 +4655,8 @@ class TabPVN:
                 "max_leaves",
                 "best_first_pair",
                 "adaptive_best_first_pair",
+                "coupled_pair_growth",
+                "honest_pair_growth",
                 "allowed",
             }
             and v is not None
@@ -4670,6 +4913,8 @@ class TabPVN:
                     "max_leaves",
                     "best_first_pair",
                     "adaptive_best_first_pair",
+                    "coupled_pair_growth",
+                    "honest_pair_growth",
                     "allowed",
                 }
             )
@@ -5175,20 +5420,21 @@ class TabPVN:
         """Attach bounded residual-pair capacity to eligible multiclass configs."""
 
         config = dict(config)
-        prep = getattr(self, "_prep", None)
-        categorical_schema = bool(
-            self._cat_groups
-            or (prep is not None and (getattr(prep, "cat_cols", ()) or getattr(prep, "text_cols", ())))
-        )
+        class_count = np.unique(y).size
         if (
             len(y) >= _MULTICLASS_RULE_GATE_MIN_ROWS
-            and np.unique(y).size > 2
-            and X.shape[1] <= _MULTICLASS_ADAPTIVE_PAIR_MAX_FEATURES
-            and not categorical_schema
+            and class_count > 2
+            and _adaptive_multiclass_pair_work_is_bounded(len(y), X.shape[1])
+            and not self._cat_groups
             and not getattr(self, "rare_event_", False)
         ):
+            max_leaves = (
+                _MULTICLASS_ADAPTIVE_PAIR_HIGH_CLASS_LEAVES
+                if class_count >= _MULTICLASS_ADAPTIVE_PAIR_HIGH_CLASS_COUNT
+                else _MULTICLASS_ADAPTIVE_PAIR_MAX_LEAVES
+            )
             config.update(
-                max_leaves=_MULTICLASS_ADAPTIVE_PAIR_MAX_LEAVES,
+                max_leaves=max_leaves,
                 best_first_pair=True,
                 adaptive_best_first_pair=True,
             )
@@ -7137,6 +7383,8 @@ class TabPVN:
                 "max_leaves",
                 "best_first_pair",
                 "adaptive_best_first_pair",
+                "coupled_pair_growth",
+                "honest_pair_growth",
                 "allowed",
             }
         }
