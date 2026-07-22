@@ -40,7 +40,7 @@ from core.kernel_fol import FOLKernel
 from tabpvn.candidate_allocation import (
     VerifierScore,
     allocate_candidates,
-    best_candidate,
+    select_final_candidate,
     verification_blocks,
 )
 from tabpvn.certified_boost import AdditiveCertifiedClassifier, AdditiveCertifiedRegressor, _fit_sample
@@ -67,6 +67,7 @@ from tabpvn.proofs import (
 )
 from tabpvn.proposers import (
     AffineLogitRead,
+    BayesianExpertRouter,
     CategoricalPosteriorChallenger,
     NumericIntervalPosteriorChallenger,
     TemporalEvidenceChallenger,
@@ -75,6 +76,7 @@ from tabpvn.proposers import (
 )
 from tabpvn.relational import _is_relational
 from tabpvn.relational import derive_features as derive_features
+from tabpvn.scenario_validation import evaluate_candidate_scenarios, latin_hypercube
 from tabpvn.trees import _flat_leaf_ids
 from tabpvn.validation import FutureValidation
 
@@ -233,6 +235,16 @@ _NUMERIC_INTERVAL_MIN_PAIRED_Z = 2.0
 _NUMERIC_INTERVAL_MAX_FOLD_LOSS = 0.0
 _NUMERIC_INTERVAL_SUPPORT_MAX_FOLD_LOSS = 0.01
 _NUMERIC_INTERVAL_MIN_SUPPORTING_WEIGHTS = 2
+
+
+def _stratified_memory_blend_weights():
+    """Cover weak-to-moderate expert authority without a user-tuned grid."""
+    midpoint = 0.5 * latin_hypercube(10, 1, seed=811)[:, 0]
+    anchors = np.asarray((0.1, 0.2, 0.3, 0.4, 0.5), dtype=float)
+    return tuple(float(value) for value in np.unique(np.r_[midpoint, anchors]))
+
+
+_STRATIFIED_MEMORY_BLEND_WEIGHTS = _stratified_memory_blend_weights()
 _NUMERIC_INTERVAL_SMOOTHING = "hierarchical"
 _NUMERIC_INTERVAL_MIN_RANK_GAIN = 0.002
 _NUMERIC_INTERVAL_MIN_FOLD_RANK_GAIN = 0.001
@@ -255,9 +267,11 @@ _RANK_CHECKPOINT_MAX_ROWS = 4_000
 _RANK_CHECKPOINT_ROUNDS = 400
 _RANK_CHECKPOINT_MIN_GAIN = 0.001
 _PROOF_PATH_MEMORY_MAX_TREES = 16
+_PROOF_PATH_HIERARCHY_MAX_TREES = 8
 _PROOF_PATH_MEMORY_SUPPORT_MULTIPLIER = 8
 _PROOF_PATH_MEMORY_MIN_RANK_GAIN = 0.006
 _PROOF_PATH_MEMORY_MIN_FOLD_GAIN = 0.003
+_PROOF_PATH_HIERARCHY_PRIOR_PER_CLASS = 1.0
 
 # A globally regularized affine logit complements the booster's local regions
 # on small, compact tables.  Its prior blend weight tapers with sample size;
@@ -272,6 +286,11 @@ _AFFINE_DECISION_MIN_PAIRED_Z = 2.0
 _AFFINE_DECISION_MAX_RANK_REGRESSION = 0.001
 _AFFINE_MIXED_MIN_STRUCTURED_FEATURES = 32
 _AFFINE_MIXED_MAX_TOKEN_FRACTION = 0.5
+_TARGET_ENCODING_MIN_RANK_GAIN = 0.003
+_TARGET_ENCODING_SUPPORT_MIN_RANK_GAIN = 0.001
+_TARGET_ENCODING_MIN_RELATIVE_LOG_LOSS_GAIN = 0.002
+_TARGET_ENCODING_MIN_ABSOLUTE_LOG_LOSS_GAIN = 1e-4
+_TARGET_ENCODING_MAX_BLOCK_REGRESSION_MULTIPLIER = 2.0
 
 
 def _pmap_workers(n_items):
@@ -390,6 +409,48 @@ def _preserve_certified_class(base, candidate):
     return out
 
 
+def _memory_expert_candidates(
+    base,
+    expert,
+    target_index,
+    splits,
+    evidence_rows,
+    weights,
+    *,
+    routed,
+):
+    """Yield globally blended and leak-safe context-routed memory candidates."""
+    for weight in weights:
+        candidate = _preserve_certified_class(
+            base,
+            (1.0 - weight) * base + weight * expert,
+        )
+        yield {
+            "routing": "global",
+            "weight": float(weight),
+            "probability": candidate,
+            "router": None,
+            "router_report": None,
+        }
+        if not routed:
+            continue
+        probability, router, report = BayesianExpertRouter.cross_fit(
+            base,
+            expert,
+            candidate,
+            target_index,
+            splits,
+            evidence_rows=evidence_rows,
+        )
+        yield {
+            "routing": "bayesian_context",
+            "weight": float(weight),
+            "probability": probability,
+            "router": router,
+            "router_report": report,
+        }
+
+
 def _multiclass_prior_rank_projection(base, prior, strength=_MULTICLASS_PRIOR_RANK_STRENGTH):
     """Temper an imbalanced class prior without changing the certified class."""
     from tabpvn.bayes import prior_shift
@@ -413,6 +474,80 @@ def _classification_rank_score(yidx, proba):
     if proba.shape[1] == 2:
         return float(roc_auc_score(yidx, proba[:, 1]))
     return float(roc_auc_score(yidx, proba, multi_class="ovo", average="macro"))
+
+
+def _target_encoding_classification_decision(
+    labels,
+    classes,
+    baseline_probability,
+    candidate_probability,
+    baseline_score,
+    candidate_score,
+    *,
+    proper_score_support=True,
+):
+    """Admit a category posterior by rank, or by weaker rank plus robust log-loss."""
+    from sklearn.metrics import log_loss
+
+    labels = np.asarray(labels)
+    classes = np.asarray(classes)
+    baseline_probability = np.asarray(baseline_probability, dtype=float)
+    candidate_probability = np.asarray(candidate_probability, dtype=float)
+    if baseline_probability.shape != candidate_probability.shape or baseline_probability.shape != (
+        len(labels),
+        len(classes),
+    ):
+        raise ValueError("target-encoding probability surfaces must align with labels and classes")
+    class_index = {value: index for index, value in enumerate(classes)}
+    encoded = np.asarray([class_index[value] for value in labels], dtype=np.int32)
+    blocks = verification_blocks(len(labels), encoded)
+    block_rank_gain = []
+    block_log_loss_gain = []
+    for block in blocks:
+        block_rank_gain.append(
+            _classification_rank_score(encoded[block], candidate_probability[block])
+            - _classification_rank_score(encoded[block], baseline_probability[block])
+        )
+        block_log_loss_gain.append(
+            float(
+                log_loss(labels[block], baseline_probability[block], labels=classes)
+                - log_loss(labels[block], candidate_probability[block], labels=classes)
+            )
+        )
+    rank_gain = float(candidate_score - baseline_score)
+    baseline_log_loss = float(log_loss(labels, baseline_probability, labels=classes))
+    candidate_log_loss = float(log_loss(labels, candidate_probability, labels=classes))
+    pooled_log_loss_gain = baseline_log_loss - candidate_log_loss
+    required_log_loss_gain = max(
+        _TARGET_ENCODING_MIN_ABSOLUTE_LOG_LOSS_GAIN,
+        _TARGET_ENCODING_MIN_RELATIVE_LOG_LOSS_GAIN * baseline_log_loss,
+    )
+    direct_rank_win = rank_gain >= _TARGET_ENCODING_MIN_RANK_GAIN
+    robust_proper_score_support = bool(
+        proper_score_support
+        and rank_gain >= _TARGET_ENCODING_SUPPORT_MIN_RANK_GAIN
+        and pooled_log_loss_gain >= required_log_loss_gain
+        and all(
+            gain >= -_TARGET_ENCODING_MAX_BLOCK_REGRESSION_MULTIPLIER * pooled_log_loss_gain
+            for gain in block_log_loss_gain
+        )
+    )
+    return {
+        "selected": bool(direct_rank_win or robust_proper_score_support),
+        "selection_path": (
+            "direct_rank_gain"
+            if direct_rank_win
+            else ("robust_proper_score_support" if robust_proper_score_support else None)
+        ),
+        "rank_gain": rank_gain,
+        "block_rank_gain": [float(value) for value in block_rank_gain],
+        "block_log_loss_gain": [float(value) for value in block_log_loss_gain],
+        "baseline_log_loss": baseline_log_loss,
+        "candidate_log_loss": candidate_log_loss,
+        "pooled_log_loss_gain": pooled_log_loss_gain,
+        "required_log_loss_gain": required_log_loss_gain,
+        "proper_score_supported": robust_proper_score_support,
+    }
 
 
 def _global_probability_candidate_evaluation(
@@ -844,6 +979,29 @@ class _CategoricalEvidenceMemory:
         take = np.concatenate((np.flatnonzero(better), tied))
         return ids[take], scores[take]
 
+    @staticmethod
+    def _select_top_k_matrix(scores, k):
+        """Vectorized dense top-k with the scalar method's exact tie rule."""
+        scores = np.asarray(scores, dtype=float)
+        if scores.ndim != 2:
+            raise ValueError("dense category scores must be a two-dimensional matrix")
+        rows, columns = scores.shape
+        k = int(k)
+        if k <= 0:
+            return np.empty((rows, 0), np.int64), np.empty((rows, 0), float)
+        if k >= columns:
+            indices = np.broadcast_to(np.arange(columns, dtype=np.int64), (rows, columns)).copy()
+            return indices, scores.copy()
+
+        cutoff = np.partition(scores, columns - k, axis=1)[:, columns - k]
+        better = scores > cutoff[:, None]
+        need = k - better.sum(axis=1)
+        tied = scores == cutoff[:, None]
+        tied_rank = np.cumsum(tied, axis=1)
+        selected = better | (tied & (tied_rank <= need[:, None]))
+        indices = np.flatnonzero(selected).reshape(rows, k) % columns
+        return indices, np.take_along_axis(scores, indices, axis=1)
+
     def _top_k(self, query_code, k=None, exclude=None):
         """Exact top-k category-overlap neighbours with a stable tie rule.
 
@@ -887,11 +1045,8 @@ class _CategoricalEvidenceMemory:
         nearest = np.empty((len(anchors), self.k), float)
         if self.n <= _CATEGORY_MEMORY_DENSE_READ_MAX_N:
             score = self._similarity(self.codes[anchors])
-            rows = np.arange(self.n)
-            for pos, anchor in enumerate(anchors):
-                local = score[pos].copy()
-                local[int(anchor)] = -np.inf
-                _indices, nearest[pos] = self._select_top_k(rows, local, self.k)
+            score[np.arange(len(anchors)), anchors] = -np.inf
+            _indices, nearest = self._select_top_k_matrix(score, self.k)
         else:
             for pos, anchor in enumerate(anchors):
                 _indices, nearest[pos] = self._top_k(self.codes[anchor], exclude=int(anchor))
@@ -903,16 +1058,24 @@ class _CategoricalEvidenceMemory:
         vote /= np.maximum(self.prior, 1e-12)
         return vote / np.maximum(vote.sum(), 1e-12)
 
+    def _vote_matrix(self, indices, local):
+        """Aggregate a dense batch of selected neighbours without row loops."""
+        weight = np.exp((local - local.max(axis=1, keepdims=True)) / self.temp)
+        labels = self.yidx[indices]
+        vote = np.zeros((len(indices), self.C), dtype=float)
+        row = np.repeat(np.arange(len(indices)), indices.shape[1])
+        np.add.at(vote, (row, labels.ravel()), weight.ravel())
+        vote /= np.maximum(self.prior[None, :], 1e-12)
+        return vote / np.maximum(vote.sum(axis=1, keepdims=True), 1e-12)
+
     def _dense_proba(self, codes):
         """Exact small-table read, chunked to bound the dense score matrix."""
         out = np.empty((len(codes), self.C))
-        rows = np.arange(self.n)
         for start in range(0, len(codes), 256):
             stop = min(len(codes), start + 256)
             score = self._similarity(codes[start:stop])
-            for pos, local in enumerate(score):
-                indices, selected = self._select_top_k(rows, local, self.k)
-                out[start + pos] = self._vote(indices, selected)
+            indices, selected = self._select_top_k_matrix(score, self.k)
+            out[start:stop] = self._vote_matrix(indices, selected)
         return out
 
     def _indexed_proba(self, codes):
@@ -1006,9 +1169,14 @@ class _ProofPathTreeIndex:
     def __init__(self, flat, X, min_support, max_support, train_leaf=None):
         self.flat = flat
         self.path_for_leaf = _flat_path_prefixes(flat)
-        feat = flat[0]
+        feat, _thr, left, right, _val = flat
+        self.parent = np.full(len(feat), -1, dtype=np.int64)
+        split_nodes = np.flatnonzero(feat >= 0)
+        self.parent[left[split_nodes]] = split_nodes
+        self.parent[right[split_nodes]] = split_nodes
         self.leaf_choice_depth = np.full(len(feat), -1, dtype=np.int16)
         train_leaf = _flat_leaf_ids(flat, X) if train_leaf is None else np.asarray(train_leaf, np.int64)
+        self.train_leaf = train_leaf
         self.leaf_postings, self.leaf_idf = {}, {}
         unique_leaf, leaf_counts = np.unique(train_leaf, return_counts=True)
         for leaf, count in zip(unique_leaf, leaf_counts, strict=False):
@@ -1044,6 +1212,61 @@ class _ProofPathTreeIndex:
                     self.leaf_choice_depth[leaf] = depth
                     break
         self.fact_count = len(self.leaf_postings) + self.prefix_fact_count
+
+    def fit_hierarchical_posterior(self, yidx, prior):
+        """Compile a finite parent-to-child Dirichlet posterior table.
+
+        Every node stores exact class counts for the rows reaching that path
+        region. A child receives one prior observation per class from its
+        already-computed parent posterior. Sparse leaves therefore back off to
+        broader certified conjunctions without discarding their local evidence.
+        """
+        yidx = np.asarray(yidx, dtype=np.int64)
+        prior = np.asarray(prior, dtype=float)
+        if len(yidx) != len(self.train_leaf):
+            raise ValueError("path labels must align with indexed training rows")
+        n_nodes, n_classes = len(self.flat[0]), len(prior)
+        self.hierarchy_posterior = np.tile(prior, (n_nodes, 1))
+        self.hierarchy_support = np.zeros(n_nodes, dtype=np.int32)
+        self.hierarchy_support[0] = len(yidx)
+        prior_strength = _PROOF_PATH_HIERARCHY_PRIOR_PER_CLASS * n_classes
+        for depth in range(self.path_for_leaf.shape[1]):
+            nodes = self.path_for_leaf[self.train_leaf, depth]
+            valid = nodes >= 0
+            if not np.any(valid):
+                continue
+            counts = np.zeros((n_nodes, n_classes), dtype=float)
+            np.add.at(counts, (nodes[valid], yidx[valid]), 1.0)
+            for node in np.unique(nodes[valid]):
+                node = int(node)
+                support = int(counts[node].sum())
+                parent = int(self.parent[node])
+                parent_probability = prior if parent <= 0 else self.hierarchy_posterior[parent]
+                self.hierarchy_posterior[node] = (counts[node] + prior_strength * parent_probability) / (
+                    support + prior_strength
+                )
+                self.hierarchy_support[node] = support
+        self.hierarchy_fact_count = int(np.count_nonzero(self.hierarchy_support[1:]))
+
+    def hierarchical_read_leaves(self, leaf):
+        """Return the deepest posterior and exact support for routed leaves."""
+        if not hasattr(self, "hierarchy_posterior"):
+            raise RuntimeError("hierarchical posterior has not been compiled")
+        node = np.asarray(leaf, dtype=np.int64).copy()
+        missing = self.hierarchy_support[node] == 0
+        while np.any(missing):
+            node[missing] = self.parent[node[missing]]
+            missing = (node > 0) & (self.hierarchy_support[node] == 0)
+        valid = node > 0
+        probability = np.tile(self.hierarchy_posterior[0], (len(node), 1))
+        support = np.zeros(len(node), dtype=np.int32)
+        probability[valid] = self.hierarchy_posterior[node[valid]]
+        support[valid] = self.hierarchy_support[node[valid]]
+        return probability, support
+
+    def hierarchical_read(self, X):
+        """Route rows, then return their deepest hierarchical posterior."""
+        return self.hierarchical_read_leaves(_flat_leaf_ids(self.flat, X))
 
     def selected_nodes(self, X):
         """Deepest support-bounded certified prefix for every query row."""
@@ -1096,10 +1319,27 @@ class _ProofPathMemory:
             _ProofPathTreeIndex(flats[tree_index], X, self.k, self.max_support, leaf_routes[tree_index])
             for tree_index in self.anchor_indices
         ]
+        hierarchy_count = min(_PROOF_PATH_HIERARCHY_MAX_TREES, len(self.indexes))
+        ranked_positions = np.argsort(np.asarray(self.anchor_information), kind="stable")
+        self.hierarchy_anchor_positions = tuple(
+            sorted(int(position) for position in ranked_positions[-hierarchy_count:])
+        )
         self.fact_count = int(sum(index.fact_count for index in self.indexes))
-        if self.fact_count == 0:
-            raise ValueError("proof-path memory found no support-bounded regions")
-        self.prior = np.bincount(self.yidx, minlength=self.C).astype(float) / self.n
+        self.hierarchical_fact_count = 0
+        self._hierarchy_compiled = False
+        self.prior = prior
+
+    def _compile_hierarchy(self):
+        if self._hierarchy_compiled:
+            return
+        for position in self.hierarchy_anchor_positions:
+            self.indexes[position].fit_hierarchical_posterior(self.yidx, self.prior)
+        self.hierarchical_fact_count = int(
+            sum(self.indexes[position].hierarchy_fact_count for position in self.hierarchy_anchor_positions)
+        )
+        if self.hierarchical_fact_count == 0:
+            raise ValueError("proof-path hierarchy found no certified regions")
+        self._hierarchy_compiled = True
 
     @staticmethod
     def _select_top_k(ids, scores, k):
@@ -1119,9 +1359,8 @@ class _ProofPathMemory:
         total = vote.sum()
         return vote / total if total > 0 else self.prior
 
-    def proba(self, X):
-        routes = [index.selected_nodes(X) for index in self.indexes]
-        out = np.tile(self.prior, (len(np.asarray(X)), 1))
+    def _local_proba_from_routes(self, routes):
+        out = np.tile(self.prior, (len(routes[0][0]), 1))
         for row in range(len(out)):
             ids, weights = [], []
             for index, (leaves, depth, nodes) in zip(self.indexes, routes, strict=False):
@@ -1149,6 +1388,42 @@ class _ProofPathMemory:
             out[row] = self._vote(candidate_ids, candidate_scores)
         return out
 
+    def proba(self, X):
+        routes = [index.selected_nodes(X) for index in self.indexes]
+        return self._local_proba_from_routes(routes)
+
+    def _hierarchical_proba_from_routes(self, routes):
+        self._compile_hierarchy()
+        n_rows = len(routes[0][0])
+        numerator = np.zeros((n_rows, self.C), dtype=float)
+        denominator = np.zeros(n_rows, dtype=float)
+        prior_strength = _PROOF_PATH_HIERARCHY_PRIOR_PER_CLASS * self.C
+        for position in self.hierarchy_anchor_positions:
+            information = self.anchor_information[position]
+            index = self.indexes[position]
+            route = routes[position]
+            probability, support = index.hierarchical_read_leaves(route[0])
+            reliability = max(float(information), 0.0) * support / (support + prior_strength)
+            numerator += reliability[:, None] * probability
+            denominator += reliability
+        out = np.tile(self.prior, (n_rows, 1))
+        informed = denominator > 0.0
+        out[informed] = numerator[informed] / denominator[informed, None]
+        return out
+
+    def hierarchical_proba(self, X):
+        """Pool recursively smoothed posteriors from certified anchor paths."""
+        routes = [index.selected_nodes(X) for index in self.indexes]
+        return self._hierarchical_proba_from_routes(routes)
+
+    def proba_modes(self, X):
+        """Expose the finite reads considered by the internal OOF selector."""
+        routes = [index.selected_nodes(X) for index in self.indexes]
+        return {
+            "local_vote": self._local_proba_from_routes(routes),
+            "hierarchical_posterior": self._hierarchical_proba_from_routes(routes),
+        }
+
     def index_report(self):
         return {
             "anchors": len(self.indexes),
@@ -1157,6 +1432,12 @@ class _ProofPathMemory:
             "path_facts": self.fact_count,
             "leaf_facts": int(sum(len(index.leaf_postings) for index in self.indexes)),
             "prefix_facts": int(sum(index.prefix_fact_count for index in self.indexes)),
+            "hierarchical_facts": self.hierarchical_fact_count,
+            "hierarchy_compiled": self._hierarchy_compiled,
+            "hierarchical_anchor_tree_indices": [
+                self.anchor_indices[position] for position in self.hierarchy_anchor_positions
+            ],
+            "hierarchical_prior_per_class": _PROOF_PATH_HIERARCHY_PRIOR_PER_CLASS,
             "training_rows": self.n,
             "neighbourhood": self.k,
             "max_region_support": self.max_support,
@@ -1318,6 +1599,9 @@ class TabPVN:
     _threshold_predicates = True
     _affine_rank_evidence = True
     _multiclass_stratified_verifier = True
+    _reuse_tuning_linear_leaf_evidence = True
+    _target_encoding_proper_score_support = True
+    _memory_blend_weights = _STRATIFIED_MEMORY_BLEND_WEIGHTS
     _parameter_names = ("seed", "alpha", "boost", "tau", "additive", "oblique", "task")
 
     def __init__(
@@ -1361,14 +1645,28 @@ class TabPVN:
         self._honest_categorical = False
         self._categorical_evidence = True
         self._categorical_posterior_evidence = True
+        self._categorical_hypergraph_posterior = bool(
+            getattr(type(self), "_categorical_hypergraph_posterior", True)
+        )
         self._numeric_interval_evidence = True
         self._proof_path_evidence = True
+        self._bayesian_expert_routing = bool(getattr(type(self), "_bayesian_expert_routing", True))
+        self._hierarchical_proof_path_memory = bool(
+            getattr(type(self), "_hierarchical_proof_path_memory", True)
+        )
+        self._temporal_context_state = bool(getattr(type(self), "_temporal_context_state", True))
+        self._temporal_context_tree = bool(getattr(type(self), "_temporal_context_tree", True))
+        self._symbolic_mdl_beam = bool(getattr(type(self), "_symbolic_mdl_beam", True))
+        self._symbolic_mdl_dnf = bool(getattr(type(self), "_symbolic_mdl_dnf", True))
+        self._symbolic_mdl_recursive_dnf = bool(getattr(type(self), "_symbolic_mdl_recursive_dnf", True))
+        self._symbolic_mdl_exception = bool(getattr(type(self), "_symbolic_mdl_exception", True))
         self.interaction_features_ = []
         self.candidate_report_ = []
         self.booster_selection_report_ = []
         self.search_allocation_report_ = []
         self.category_memory_report_ = []
         self._category_memory_metric = "rarity"
+        self._category_memory_router = None
         self.category_posterior_report_ = []
         self.numeric_interval_report_ = []
         self.affine_rank_report_ = []
@@ -1382,6 +1680,8 @@ class TabPVN:
         self._affine_composition = "arithmetic"
         self._affine_decision_oof_labels = None
         self.proof_path_memory_report_ = []
+        self._proof_path_memory_mode = "local_vote"
+        self._proof_path_memory_router = None
         self.smooth_memory_report_ = []
         self.multiclass_signal_report_ = []
         self._no_signal_prior = None
@@ -1680,7 +1980,11 @@ class TabPVN:
                 if self.task == "auto"
                 else self.task
             )
-            challenger = TemporalEvidenceChallenger(seed=self.seed)
+            challenger = TemporalEvidenceChallenger(
+                seed=self.seed,
+                _context_state=self._temporal_context_state,
+                _context_tree=self._temporal_context_tree,
+            )
             gate_samples: dict[Any, tuple[Any, np.ndarray, dict[str, Any]]] = {}
             for pair_rank in sorted({candidate.pair_rank for candidate in candidates}):
                 pair_candidates = tuple(item for item in candidates if item.pair_rank == pair_rank)
@@ -1840,7 +2144,11 @@ class TabPVN:
         validation, order = FutureValidation.from_timestamps(data[timestamp]).sorted()
         report = evidence_report
         if report is None:
-            report = TemporalEvidenceChallenger(seed=self.seed).evaluate(
+            report = TemporalEvidenceChallenger(
+                seed=self.seed,
+                _context_state=self._temporal_context_state,
+                _context_tree=self._temporal_context_tree,
+            ).evaluate(
                 data,
                 target_values,
                 entity=entity,
@@ -1856,10 +2164,21 @@ class TabPVN:
         if selected:
             from tabpvn.temporal import TemporalLaplaceMap
 
+            deploy_context_state = bool(
+                self._temporal_context_state
+                and report.get("context_state_selected", self._temporal_context_state)
+            )
+            deploy_context_tree = bool(
+                self._temporal_context_tree
+                and deploy_context_state
+                and report.get("context_tree_selected", False)
+            )
             temporal_map = TemporalLaplaceMap(
                 entity,
                 timestamp,
                 value_columns=values,
+                _context_state=deploy_context_state,
+                _context_tree=deploy_context_tree,
             )
             model_data = temporal_map.fit_augment(ordered_data)
             report.update(
@@ -1867,6 +2186,8 @@ class TabPVN:
                     "deployed_features": int(len(temporal_map.feature_names_)),
                     "deployed_scales_seconds": [float(scale) for scale in temporal_map.scales_seconds_],
                     "deployed_channels": [str(channel) for channel in temporal_map.channel_names_],
+                    "deployed_context_state": dict(temporal_map.report_["context_state"]),
+                    "deployed_context_tree": dict(temporal_map.report_["context_tree"]),
                 }
             )
         else:
@@ -1939,6 +2260,9 @@ class TabPVN:
         self.candidate_report_ = [gate_report("certified_boost", True, stage="predictor")]
         self.booster_selection_report_ = [gate_report("auto_boost", True, stage="predictor")]
         self.search_allocation_report_ = []
+        self.linear_leaf_report_ = []
+        self._linear_leaf_tune_config = None
+        self._linear_leaf_tune_decision = None
         self.rare_architecture_report_ = []
         self.regression_loss_report_ = []
         self.feature_screen_report_ = []
@@ -1948,6 +2272,7 @@ class TabPVN:
         self.target_encoding_variant_ = "none"
         self.category_memory_report_ = []
         self._category_memory_metric = "rarity"
+        self._category_memory_router = None
         self.category_posterior_report_ = []
         self.numeric_interval_report_ = []
         self.affine_rank_report_ = []
@@ -1955,6 +2280,8 @@ class TabPVN:
         self._category_posterior_aggregation = None
         self._category_posterior_smoothing = None
         self.proof_path_memory_report_ = []
+        self._proof_path_memory_mode = "local_vote"
+        self._proof_path_memory_router = None
         self.multiclass_signal_report_ = []
         self._no_signal_prior = None
         self.prior_rank_report_ = []
@@ -2128,13 +2455,14 @@ class TabPVN:
             cw = self._auto_class_weight(X, y, boost)  # balance minority ONLY if it helps (gated)
             if cw is not None:
                 boost["class_weight"] = cw
-        if (
-            self.mode == "classification"
-            and auto_cfg
-            and not self.rare_event_
-            and self._auto_linear_leaf_clf(X, y, boost)
-        ):
-            boost["linear_leaf"] = True  # logit-linear leaves ONLY where they clearly help (gated)
+        linear_leaf_decision = None
+        if self._linear_leaf_tune_config == boost:
+            linear_leaf_decision = self._linear_leaf_tune_decision
+        if self.mode == "classification" and auto_cfg and not self.rare_event_:
+            if linear_leaf_decision is None:
+                linear_leaf_decision = self._auto_linear_leaf_clf(X, y, boost)
+            if linear_leaf_decision:
+                boost["linear_leaf"] = True  # logit-linear leaves ONLY where they clearly help (gated)
         if self.mode == "classification" and auto_cfg and not self.rare_event_:
             joint_boost = self._auto_joint_rank_regions(X, y, boost)
             if joint_boost is not None:
@@ -2252,18 +2580,41 @@ class TabPVN:
         self._affine_decision_oof_labels = None  # transient selected OOF top-1 decisions
         self._sdm = None  # SDM-attention associative-memory member (set below for text classification)
         if self.additive:  # full-coverage proof-carrying ensemble
+            predictor_boost = dict(boost)
+            if self.mode == "classification" and predictor_boost.get("refit", True) is False:
+                # The deploy fit reserves label-disjoint evidence for confidence
+                # calibration. Internal checkpoint labels only choose tree count.
+                predictor_boost["independent_calibration"] = True
             predictor = (
-                self._classifier(**boost)
+                self._classifier(**predictor_boost)
                 if self.mode == "classification"
-                else AdditiveCertifiedRegressor(seed=self.seed, **boost)
+                else AdditiveCertifiedRegressor(seed=self.seed, **predictor_boost)
             )
             self._pred = self._fit_certified(predictor, X, y)
             if self.mode == "classification" and np.unique(y).size > 2:
                 adaptive_pair_enabled = bool(boost.get("adaptive_best_first_pair", False))
+                verifier_gate_enabled = bool(boost.get("verifier_gated_pair_growth", False))
                 deployed_schedule = tuple(getattr(self._pred, "pair_growth_schedule_", ()))
+                attempted_schedule = tuple(getattr(self._pred, "attempted_pair_growth_schedule_", ()))[
+                    : len(deployed_schedule)
+                ]
                 active_rounds = sum(bool(pair) for pair in deployed_schedule)
+                attempted_rounds = sum(bool(pair) for pair in attempted_schedule)
+                rejected_rounds = max(0, attempted_rounds - active_rounds)
                 if adaptive_pair_enabled:
-                    reason = "verified_residual_pair" if active_rounds else "no_verified_residual_pair"
+                    reason = (
+                        "verified_pair_expert"
+                        if active_rounds and verifier_gate_enabled
+                        else (
+                            "verified_residual_pair"
+                            if active_rounds
+                            else (
+                                "pair_expert_rejected"
+                                if rejected_rounds and verifier_gate_enabled
+                                else "no_verified_residual_pair"
+                            )
+                        )
+                    )
                 elif len(y) < _MULTICLASS_RULE_GATE_MIN_ROWS:
                     reason = "insufficient_verifier_rows"
                 elif not _adaptive_multiclass_pair_work_is_bounded(len(y), self.n_input_features_):
@@ -2279,10 +2630,18 @@ class TabPVN:
                         stage="predictor",
                         reason=reason,
                         controller_enabled=adaptive_pair_enabled,
-                        evidence_source="held_out_residual_dynamics",
+                        verifier_gate_enabled=verifier_gate_enabled,
+                        evidence_source=(
+                            "held_out_residual_dynamics_and_proper_score"
+                            if verifier_gate_enabled
+                            else "held_out_residual_dynamics"
+                        ),
+                        proper_score=("negative_log_loss" if verifier_gate_enabled else None),
                         monitored_rounds=int(getattr(self._pred, "residual_dynamics_monitored_rounds_", 0)),
                         deployed_rounds=int(len(deployed_schedule)),
+                        attempted_rounds=int(attempted_rounds),
                         active_rounds=int(active_rounds),
+                        rejected_rounds=int(rejected_rounds),
                     )
                 )
             if self._fit_validation is not None:
@@ -2417,11 +2776,17 @@ class TabPVN:
                 w = self._proof_path_memory_gate(X, y, precomp=_oof)
                 if w > 0:
                     try:
-                        self._proof_path_memory = _ProofPathMemory(self._pred, X, y, self._pred.classes_)
+                        memory = _ProofPathMemory(self._pred, X, y, self._pred.classes_)
+                        if self._proof_path_memory_mode == "hierarchical_posterior":
+                            memory._compile_hierarchy()
+                        self._proof_path_memory = memory
                     except Exception:
                         self._proof_path_oof_proba = None  # final index must fail closed too
                     else:
                         self._proof_path_memory_w = w
+                        self.proof_path_memory_report_[-1]["deployed_evidence"] = (
+                            self._proof_path_memory.index_report()
+                        )
                         if self._proof_path_oof_proba is not None:
                             blended = self._proof_path_oof_proba
                             labels = np.asarray(self._pred.classes_)[blended.argmax(1)]
@@ -2459,6 +2824,7 @@ class TabPVN:
                             metadata=metadata,
                             aggregation=self._category_posterior_aggregation,
                             smoothing=self._category_posterior_smoothing,
+                            _hypergraph=self._categorical_hypergraph_posterior,
                         )
                         self._refresh_classification_confidence(X, y, self._category_posterior_oof_proba)
                     except (TypeError, ValueError, FloatingPointError):
@@ -2699,16 +3065,34 @@ class TabPVN:
                     groups=train_groups,
                 )
 
-                def score(model, X):
+                def probability(model, X):
                     logits = model._scores(X)
                     probs = np.exp(logits - logits.max(1, keepdims=True))
                     probs /= probs.sum(1, keepdims=True)
+                    return probs
+
+                def score(probs):
                     if probs.shape[1] == 2:
                         return float(roc_auc_score(yg[va], probs[:, 1]))
                     return float(roc_auc_score(yg[va], probs, multi_class="ovo", average="macro"))
 
-                base_score, encoded_score = score(base, plain_va), score(encoded, target_va)
-                selected = encoded_score >= base_score + 0.003
+                base_probability = probability(base, plain_va)
+                encoded_probability = probability(encoded, target_va)
+                base_score, encoded_score = score(base_probability), score(encoded_probability)
+                decision = _target_encoding_classification_decision(
+                    yg[va],
+                    base.classes_,
+                    base_probability,
+                    encoded_probability,
+                    base_score,
+                    encoded_score,
+                    proper_score_support=getattr(
+                        self,
+                        "_target_encoding_proper_score_support",
+                        True,
+                    ),
+                )
+                selected = bool(decision["selected"])
                 self.target_encoding_variant_ = "mean" if selected else "none"
                 self.target_encoding_report_.append(
                     {
@@ -2717,8 +3101,22 @@ class TabPVN:
                         "metric": "roc_auc" if len(np.unique(yg)) == 2 else "macro_ovo_auc",
                         "frequency_score": float(base_score),
                         "mean_score": float(encoded_score),
-                        "required_gain": 0.003,
-                        "reason": "posterior_mean_win" if selected else "mean_gain_below_gate",
+                        "rank_gain": float(decision["rank_gain"]),
+                        "required_gain": _TARGET_ENCODING_MIN_RANK_GAIN,
+                        "supported_rank_gain": _TARGET_ENCODING_SUPPORT_MIN_RANK_GAIN,
+                        "block_rank_gain": decision["block_rank_gain"],
+                        "block_log_loss_gain": decision["block_log_loss_gain"],
+                        "frequency_log_loss": float(decision["baseline_log_loss"]),
+                        "mean_log_loss": float(decision["candidate_log_loss"]),
+                        "pooled_log_loss_gain": float(decision["pooled_log_loss_gain"]),
+                        "required_log_loss_gain": float(decision["required_log_loss_gain"]),
+                        "proper_score_supported": bool(decision["proper_score_supported"]),
+                        "selection_path": decision["selection_path"],
+                        "reason": (
+                            str(decision["selection_path"])
+                            if selected
+                            else "rank_and_proper_score_below_gate"
+                        ),
                         "rows": int(len(yg)),
                     }
                 )
@@ -3395,6 +3793,8 @@ class TabPVN:
         the FOL-certified boosted class.
         """
         self._proof_path_oof_proba = None
+        self._proof_path_memory_mode = "local_vote"
+        self._proof_path_memory_router = None
         self.proof_path_memory_report_ = [{"name": "proof_path_memory", "selected": False}]
         if precomp is None or self._has_text() or len(X) < 200 or len(X) > _PROOF_PATH_MEMORY_MAX_N:
             return 0.0
@@ -3419,17 +3819,37 @@ class TabPVN:
         if getattr(self, "_category_memory_oof_proba", None) is not None:
             base = self._category_memory_oof_proba
         try:
-            memory = np.zeros_like(base)
+            memories = {}
             reports = []
             for (tri, vai), fold_model in zip(splits, models, strict=False):
                 member = _ProofPathMemory(fold_model, X[tri], y[tri], classes)
-                memory[vai] = member.proba(X[vai])
+                if getattr(self, "_hierarchical_proof_path_memory", True) and hasattr(member, "proba_modes"):
+                    fold_memories = member.proba_modes(X[vai])
+                else:
+                    fold_memories = {"local_vote": member.proba(X[vai])}
+                if not memories:
+                    memories = {name: np.zeros_like(base) for name in fold_memories}
+                if memories.keys() != fold_memories.keys():
+                    raise ValueError("proof-path folds exposed inconsistent memory modes")
+                for name, probability in fold_memories.items():
+                    memories[name][vai] = probability
                 reports.append(member.index_report())
             base_score = _classification_rank_score(yi[evidence_rows], base[evidence_rows])
             base_fold = np.array([_classification_rank_score(yi[vai], base[vai]) for _tri, vai in splits])
-            best = (base_score, 0.0, np.zeros(len(splits)), base)
-            for weight in (0.1, 0.2, 0.3, 0.4, 0.5):
-                blended = _preserve_certified_class(base, (1.0 - weight) * base + weight * memory)
+            best = {
+                "score": base_score,
+                "weight": 0.0,
+                "fold_delta": np.zeros(len(splits)),
+                "blend": base,
+                "routing": "global",
+                "router": None,
+                "router_report": None,
+                "mode": "local_vote",
+            }
+            evaluations = []
+
+            def evaluate(proposal):
+                blended = proposal["probability"]
                 score = _classification_rank_score(yi[evidence_rows], blended[evidence_rows])
                 fold_delta = np.array(
                     [
@@ -3437,8 +3857,87 @@ class TabPVN:
                         for i, (_tri, vai) in enumerate(splits)
                     ]
                 )
-                if score > best[0]:
-                    best = (score, weight, fold_delta, blended)
+                return score, fold_delta
+
+            for mode, memory in memories.items():
+                proposals = list(
+                    _memory_expert_candidates(
+                        base,
+                        memory,
+                        yi,
+                        splits,
+                        evidence_rows,
+                        self._memory_blend_weights,
+                        routed=False,
+                    )
+                )
+                route_seed = None
+                for proposal in proposals:
+                    score, fold_delta = evaluate(proposal)
+                    evaluations.append(
+                        {
+                            "mode": mode,
+                            "weight": float(proposal["weight"]),
+                            "routing": proposal["routing"],
+                            "oof_rank_auc": float(score),
+                            "fold_auc_delta": [float(value) for value in fold_delta],
+                            "router": None,
+                        }
+                    )
+                    if route_seed is None or score > route_seed[0]:
+                        route_seed = (score, proposal)
+                    if score > best["score"]:
+                        best.update(
+                            score=score,
+                            weight=proposal["weight"],
+                            fold_delta=fold_delta,
+                            blend=proposal["probability"],
+                            routing="global",
+                            router=None,
+                            router_report=None,
+                            mode=mode,
+                        )
+
+                if not getattr(self, "_bayesian_expert_routing", True) or route_seed is None:
+                    continue
+                routed_proposals = _memory_expert_candidates(
+                    base,
+                    memory,
+                    yi,
+                    splits,
+                    evidence_rows,
+                    (route_seed[1]["weight"],),
+                    routed=True,
+                )
+                routed_proposal = next(
+                    proposal for proposal in routed_proposals if proposal["routing"] == "bayesian_context"
+                )
+                score, fold_delta = evaluate(routed_proposal)
+                router_report = routed_proposal["router_report"]
+                evaluations.append(
+                    {
+                        "mode": mode,
+                        "weight": float(routed_proposal["weight"]),
+                        "routing": routed_proposal["routing"],
+                        "oof_rank_auc": float(score),
+                        "fold_auc_delta": [float(value) for value in fold_delta],
+                        "router": {
+                            "enabled_contexts": router_report["enabled_contexts"],
+                            "routed_rows": router_report["routed_rows"],
+                        },
+                    }
+                )
+                if score > best["score"]:
+                    best.update(
+                        score=score,
+                        weight=routed_proposal["weight"],
+                        fold_delta=fold_delta,
+                        blend=routed_proposal["probability"],
+                        routing=routed_proposal["routing"],
+                        router=routed_proposal["router"],
+                        router_report=router_report,
+                        mode=mode,
+                    )
         except Exception:
             return 0.0
         # Path regions are a flexible derived view of the boosted program, so
@@ -3447,24 +3946,30 @@ class TabPVN:
         # proved insufficient to transfer. Require material evidence globally
         # and in every independently fitted fold.
         selected = bool(
-            best[1] > 0.0
-            and best[0] >= base_score + _PROOF_PATH_MEMORY_MIN_RANK_GAIN
-            and np.all(best[2] >= _PROOF_PATH_MEMORY_MIN_FOLD_GAIN)
+            best["weight"] > 0.0
+            and best["score"] >= base_score + _PROOF_PATH_MEMORY_MIN_RANK_GAIN
+            and np.all(best["fold_delta"] >= _PROOF_PATH_MEMORY_MIN_FOLD_GAIN)
         )
         self.proof_path_memory_report_ = [
             {"name": "certified_boost", "oof_rank_auc": float(base_score), "selected": not selected},
             {
                 "name": "proof_path_memory",
-                "oof_rank_auc": float(best[0]),
-                "fold_auc_delta": [float(value) for value in best[2]],
-                "weight": float(best[1]),
+                "oof_rank_auc": float(best["score"]),
+                "fold_auc_delta": [float(value) for value in best["fold_delta"]],
+                "weight": float(best["weight"]),
+                "mode": best["mode"],
+                "routing": best["routing"],
+                "router": best["router_report"],
+                "candidates": evaluations,
                 "parameters": reports,
                 "selected": selected,
             },
         ]
         if selected:
-            self._proof_path_oof_proba = best[3]
-        return float(best[1]) if selected else 0.0
+            self._proof_path_memory_mode = best["mode"]
+            self._proof_path_memory_router = best["router"]
+            self._proof_path_oof_proba = best["blend"]
+        return float(best["weight"]) if selected else 0.0
 
     def _smooth_gate(self, X, y, w, fw, precomp=None):
         """Leak-safe gate for fixed and adaptive local probability geometry.
@@ -3574,6 +4079,7 @@ class TabPVN:
                         "max_leaves",
                         "best_first_pair",
                         "adaptive_best_first_pair",
+                        "verifier_gated_pair_growth",
                         "coupled_pair_growth",
                         "honest_pair_growth",
                         "allowed",
@@ -3738,6 +4244,7 @@ class TabPVN:
         groups = _onehot_groups(self._prep)
         self._category_memory_oof_proba = None
         self._category_memory_metric = "rarity"
+        self._category_memory_router = None
         self.category_memory_report_ = [{"name": "categorical_evidence", "selected": False}]
         if (
             precomp is None
@@ -3796,14 +4303,27 @@ class TabPVN:
                 "fold_delta": np.zeros(len(splits)),
                 "blend": base,
                 "metric": "rarity",
+                "routing": "global",
+                "router": None,
+                "router_report": None,
             }
             evaluations = []
             for metric, memory in memories.items():
-                for weight in (0.1, 0.2, 0.3, 0.4, 0.5):
-                    blended = _preserve_certified_class(
+                proposals = list(
+                    _memory_expert_candidates(
                         base,
-                        (1.0 - weight) * base + weight * memory,
+                        memory,
+                        yi,
+                        splits,
+                        evidence_rows,
+                        self._memory_blend_weights,
+                        routed=False,
                     )
+                )
+                route_seed = None
+                for proposal in proposals:
+                    weight = proposal["weight"]
+                    blended = proposal["probability"]
                     score = _classification_rank_score(yi[evidence_rows], blended[evidence_rows])
                     fold_delta = np.array(
                         [
@@ -3815,10 +4335,14 @@ class TabPVN:
                         {
                             "metric": metric,
                             "weight": float(weight),
+                            "routing": proposal["routing"],
                             "oof_rank_auc": float(score),
                             "fold_auc_delta": [float(value) for value in fold_delta],
+                            "router": None,
                         }
                     )
+                    if route_seed is None or score > route_seed[0]:
+                        route_seed = (score, proposal)
                     if score > best["score"]:
                         best = {
                             "score": score,
@@ -3826,7 +4350,58 @@ class TabPVN:
                             "fold_delta": fold_delta,
                             "blend": blended,
                             "metric": metric,
+                            "routing": "global",
+                            "router": None,
+                            "router_report": None,
                         }
+                if not getattr(self, "_bayesian_expert_routing", True) or route_seed is None:
+                    continue
+                routed_proposals = _memory_expert_candidates(
+                    base,
+                    memory,
+                    yi,
+                    splits,
+                    evidence_rows,
+                    (route_seed[1]["weight"],),
+                    routed=True,
+                )
+                routed_proposal = next(
+                    proposal for proposal in routed_proposals if proposal["routing"] == "bayesian_context"
+                )
+                weight = routed_proposal["weight"]
+                blended = routed_proposal["probability"]
+                score = _classification_rank_score(yi[evidence_rows], blended[evidence_rows])
+                fold_delta = np.array(
+                    [
+                        _classification_rank_score(yi[vai], blended[vai]) - base_fold[i]
+                        for i, (_tri, vai) in enumerate(splits)
+                    ]
+                )
+                router_report = routed_proposal["router_report"]
+                evaluations.append(
+                    {
+                        "metric": metric,
+                        "weight": float(weight),
+                        "routing": routed_proposal["routing"],
+                        "oof_rank_auc": float(score),
+                        "fold_auc_delta": [float(value) for value in fold_delta],
+                        "router": {
+                            "enabled_contexts": router_report["enabled_contexts"],
+                            "routed_rows": router_report["routed_rows"],
+                        },
+                    }
+                )
+                if score > best["score"]:
+                    best = {
+                        "score": score,
+                        "weight": weight,
+                        "fold_delta": fold_delta,
+                        "blend": blended,
+                        "metric": metric,
+                        "routing": routed_proposal["routing"],
+                        "router": routed_proposal["router"],
+                        "router_report": router_report,
+                    }
         except Exception:
             return 0.0
         selected = bool(
@@ -3840,6 +4415,8 @@ class TabPVN:
                 "fold_auc_delta": [float(value) for value in best["fold_delta"]],
                 "weight": float(best["weight"]),
                 "metric": best["metric"],
+                "routing": best["routing"],
+                "router": best["router_report"],
                 "label_information_strength": (
                     _CATEGORY_MEMORY_INFORMATION_STRENGTH if best["metric"] != "rarity" else 0.0
                 ),
@@ -3858,6 +4435,7 @@ class TabPVN:
         ]
         if selected:
             self._category_memory_metric = best["metric"]
+            self._category_memory_router = best["router"]
             self._category_memory_oof_proba = best["blend"]
         return float(best["weight"]) if selected else 0.0
 
@@ -3914,10 +4492,15 @@ class TabPVN:
         if getattr(self, "_proof_path_oof_proba", None) is not None:
             base = self._proof_path_oof_proba
 
+        posterior_aggregations = (
+            CategoricalPosteriorChallenger.AGGREGATIONS
+            if self._categorical_hypergraph_posterior
+            else CategoricalPosteriorChallenger.BASE_AGGREGATIONS
+        )
         candidates = {
             (smoothing, aggregation, weight): base.copy()
             for smoothing in CategoricalPosteriorChallenger.SMOOTHING
-            for aggregation in CategoricalPosteriorChallenger.AGGREGATIONS
+            for aggregation in posterior_aggregations
             for weight in _CATEGORY_POSTERIOR_WEIGHTS
         }
         evidence_reports = []
@@ -3929,6 +4512,7 @@ class TabPVN:
                     classes,
                     groups,
                     metadata=metadata,
+                    _hypergraph=self._categorical_hypergraph_posterior,
                 )
                 posteriors = challenger.posterior_grid(X[valid])
                 for (smoothing, aggregation), posterior in posteriors.items():
@@ -3939,7 +4523,7 @@ class TabPVN:
                             )
                         )
                 report = challenger.report()
-                report["aggregations_evaluated"] = list(CategoricalPosteriorChallenger.AGGREGATIONS)
+                report["aggregations_evaluated"] = list(challenger.available_aggregations)
                 report["smoothing_evaluated"] = (
                     list(CategoricalPosteriorChallenger.SMOOTHING)
                     if challenger.hierarchical_candidate
@@ -4504,6 +5088,7 @@ class TabPVN:
                 "max_leaves",
                 "best_first_pair",
                 "adaptive_best_first_pair",
+                "verifier_gated_pair_growth",
                 "coupled_pair_growth",
                 "honest_pair_growth",
                 "allowed",
@@ -4655,6 +5240,7 @@ class TabPVN:
                 "max_leaves",
                 "best_first_pair",
                 "adaptive_best_first_pair",
+                "verifier_gated_pair_growth",
                 "coupled_pair_growth",
                 "honest_pair_growth",
                 "allowed",
@@ -4803,10 +5389,16 @@ class TabPVN:
             return proba
 
         try:
-            # LEVER A: classification with an out-of-fit deploy holdout (refit=False deploy fit, i.e. large n) —
-            # calibrate the precision layer on the deploy model's OWN leak-safe holdout residuals instead of
-            # fitting a separate K-fold OOF ensemble. Same precision guarantee (measured), drops the OOF phase.
-            ver = getattr(self._pred, "ver_", None) if self.mode == "classification" else None
+            # A non-refit deploy classifier can reserve a second holdout that
+            # played no role in checkpoint selection. Reuse only evidence with
+            # that explicit role; ordinary early-stop verifier rows are not
+            # valid calibration labels and fall through to cross-fitting.
+            verifier_role = getattr(self._pred, "verifier_evidence_role_", None)
+            ver = (
+                getattr(self._pred, "ver_", None)
+                if self.mode == "classification" and verifier_role == "independent_calibration"
+                else None
+            )
             if ver is not None and len(ver) >= 200:
                 from tabpvn.certified_confidence import CertifiedClassConfidence
 
@@ -4850,12 +5442,12 @@ class TabPVN:
                     scores,
                     yh,
                     ver_weight,
-                    "deploy_verifier",
+                    "independent_deploy_holdout",
                     threshold_groups,
                 )
                 if self._fit_validation is not None:
                     self.validation_report_["confidence_rows"] = int(len(yh))
-                    self.validation_report_["confidence_source"] = "deploy_future_verifier"
+                    self.validation_report_["confidence_source"] = "independent_future_holdout"
                 return
             calibration_weight = None
             calibration_groups = self._validation_groups()
@@ -4913,6 +5505,7 @@ class TabPVN:
                     "max_leaves",
                     "best_first_pair",
                     "adaptive_best_first_pair",
+                    "verifier_gated_pair_growth",
                     "coupled_pair_growth",
                     "honest_pair_growth",
                     "allowed",
@@ -4925,6 +5518,8 @@ class TabPVN:
             # multi-fold OOF keeps the established faster no-refit path.
             kw["refit"] = self._fit_validation is not None
             oof_scores = None if self.mode == "regression" else np.zeros((len(y), len(np.unique(y))))
+            precomp_weight = None
+            precomp_source = "out_of_fold"
             splits = self._validation_splits(
                 y,
                 folds=folds,
@@ -4965,6 +5560,8 @@ class TabPVN:
                 oof = precomp["pred"]  # (the smooth gate built it) -> no re-fit
                 oof_scores = precomp["scores"]
                 evidence_rows = np.asarray(precomp.get("evidence_rows", np.arange(len(y))), dtype=int)
+                precomp_weight = precomp.get("evidence_weight")
+                precomp_source = str(precomp.get("source", "out_of_fold"))
             else:
                 for val, pred, sc in _pmap(
                     {i: _fold(trn, va) for i, (trn, va) in enumerate(splits)}
@@ -4977,7 +5574,13 @@ class TabPVN:
                 self.validation_report_["confidence_rows"] = int(len(evidence_rows))
                 self.validation_report_["confidence_source"] = "refitted_past_future_tail"
             evidence_weight = (
-                None if calibration_weight is None else np.asarray(calibration_weight)[evidence_rows]
+                np.asarray(precomp_weight, dtype=float)
+                if precomp_weight is not None
+                else (
+                    None
+                    if calibration_weight is None
+                    else np.asarray(calibration_weight)[evidence_rows]
+                )
             )
             if self.mode == "regression":
                 from tabpvn.certified_confidence import CertifiedConfidence
@@ -4998,7 +5601,7 @@ class TabPVN:
                     oof_scores[evidence_rows],
                     y[evidence_rows],
                     evidence_weight,
-                    "future_holdout" if self._fit_validation is not None else "out_of_fold",
+                    "future_holdout" if self._fit_validation is not None else precomp_source,
                     (None if calibration_groups is None else calibration_groups[evidence_rows]),
                 )
                 ci = {c: i for i, c in enumerate(self._pred.classes_)}
@@ -5035,14 +5638,25 @@ class TabPVN:
             prune_dominated=prune_dominated,
         )
 
+    def _select_search_finalist(self, scores, candidates, baseline_index, *, maximize):
+        """Nominate the lower-tail-stable challenger for deployment gating."""
+
+        return select_final_candidate(
+            scores,
+            candidates,
+            baseline_index,
+            maximize=maximize,
+        )
+
     def _successive_halving(self, cands, base_idx, score_fn, rungs, maximize):
         """Verifier-relative SUCCESSIVE HALVING over the candidate configs.
 
         Every candidate receives the tiny first budget. Paired metric blocks then allocate the next budget by
         median group-relative evidence while retaining both the absolute metric leader and BASE. Starting at
         the semifinal, a candidate can be removed early when another candidate is at least as good on every
-        paired block. Only finalists pay for the full fit, and the final winner is still chosen by the original
-        absolute objective before the caller's baseline hysteresis. Deterministic.
+        paired block. Only finalists pay for the full fit. Correlated scenario stress tests then nominate the
+        lower-tail-stable challenger before the caller applies its original absolute baseline hysteresis and
+        secondary-metric safety gates. Deterministic.
         """
         survivors = list(range(len(cands)))
         scores = {}
@@ -5075,8 +5689,14 @@ class TabPVN:
             }
             self.search_allocation_report_.append(report)
             survivors = list(decision.promoted)
-        best = best_candidate(scores, survivors, maximize=maximize)
-        return best, scores, survivors
+        final = self._select_search_finalist(
+            scores,
+            survivors,
+            base_idx,
+            maximize=maximize,
+        )
+        self.search_allocation_report_.append(final.report)
+        return final.candidate, scores, survivors
 
     def _auto_rare_architecture(self, X, y):
         """Admit rare-event handling only after a paired rank-metric win.
@@ -5437,6 +6057,7 @@ class TabPVN:
                 max_leaves=max_leaves,
                 best_first_pair=True,
                 adaptive_best_first_pair=True,
+                verifier_gated_pair_growth=True,
             )
         return config
 
@@ -5629,6 +6250,7 @@ class TabPVN:
 
             def run():
                 rank_scores, paired_rank_scores, rare_scores, accuracies = [], [], [], []
+                fold_log_loss, paired_log_loss = [], []
                 for tr, va in splits:
                     classifier_kwargs = dict(
                         rounds=rung["rounds"],
@@ -5658,11 +6280,19 @@ class TabPVN:
                     accuracies.append(np.average(predicted == ys[va], weights=validation_weight))
                     class_index = {value: index for index, value in enumerate(classes)}
                     yidx = np.array([class_index[value] for value in ys[va]], dtype=np.int64)
-                    rank_scores.append(_classification_rank_score(yidx, proba))
-                    paired_rank_scores.extend(
-                        _classification_rank_score(yidx[block], proba[block])
-                        for block in verification_blocks(len(va), yidx)
+                    row_log_loss = -np.log(
+                        np.clip(
+                            proba[np.arange(len(yidx)), yidx],
+                            np.finfo(float).tiny,
+                            1.0,
+                        )
                     )
+                    fold_log_loss.append(float(np.average(row_log_loss, weights=validation_weight)))
+                    rank_scores.append(_classification_rank_score(yidx, proba))
+                    for block in verification_blocks(len(va), yidx):
+                        paired_rank_scores.append(_classification_rank_score(yidx[block], proba[block]))
+                        block_weight = None if validation_weight is None else validation_weight[block]
+                        paired_log_loss.append(float(np.average(row_log_loss[block], weights=block_weight)))
                     if rare_event:
                         from sklearn.metrics import average_precision_score
 
@@ -5684,10 +6314,14 @@ class TabPVN:
                             float(np.mean(accuracies)),
                         ),
                         tuple(float(score) for score in paired_rank_scores),
+                        tuple(fold_log_loss),
+                        tuple(paired_log_loss),
                     )
                 return VerifierScore(
                     (float(np.mean(rank_scores)), float(np.mean(accuracies))),
                     tuple(float(score) for score in paired_rank_scores),
+                    tuple(fold_log_loss),
+                    tuple(paired_log_loss),
                 )
 
             return run
@@ -5727,9 +6361,111 @@ class TabPVN:
             pick["allowed"] = tuple(int(feature) for feature in final_allowed)
         # patience 30->20: clf holdout log-loss reaches ~99.7% of its final gain by ~round 100, so 20 trailing
         # rounds past the best is ample; 30 just fits ~10 extra trees per class that don't move accuracy.
-        return self._with_adaptive_multiclass_pair_growth(
+        resolved = self._with_adaptive_multiclass_pair_growth(
             X, y, dict(rounds=800, patience=20, **{k: v for k, v in pick.items() if k != "patience"})
         )
+
+        # Reuse the selected constant candidate's final-rung evidence for the
+        # linear-leaf architecture gate. The old gate refit both sides on an
+        # independent CV split; only the new challenger needs fitting here.
+        constant_score = scores.get(pick_idx)
+        if (
+            not rare_event
+            and np.unique(y).size == 2
+            and self._reuse_tuning_linear_leaf_evidence
+            and isinstance(constant_score, VerifierScore)
+            and len(constant_score.fold_log_loss) >= 2
+            and len(constant_score.paired_log_loss) >= 4
+        ):
+            try:
+                linear_score = score_fn({**pick, "linear_leaf": True}, rungs[-1])()
+                linear_rank, linear_accuracy = linear_score
+                constant_rank, constant_accuracy = constant_score
+                linear_fold_loss = np.asarray(linear_score.fold_log_loss, dtype=float)
+                constant_fold_loss = np.asarray(constant_score.fold_log_loss, dtype=float)
+                rank_scenarios = evaluate_candidate_scenarios(
+                    np.asarray(
+                        [linear_score.paired_primary, constant_score.paired_primary],
+                        dtype=float,
+                    ),
+                    baseline_position=1,
+                    seed=self.seed + 1709,
+                )
+                loss_scenarios = evaluate_candidate_scenarios(
+                    -np.asarray(
+                        [linear_score.paired_log_loss, constant_score.paired_log_loss],
+                        dtype=float,
+                    ),
+                    baseline_position=1,
+                    seed=self.seed + 1721,
+                )
+                rank_gain = float(linear_rank - constant_rank)
+                accuracy_delta = float(linear_accuracy - constant_accuracy)
+                loss_gain = float(
+                    (constant_fold_loss.mean() - linear_fold_loss.mean())
+                    / max(constant_fold_loss.mean(), np.finfo(float).tiny)
+                )
+                rank_robust = bool(rank_scenarios.lower_relative_utility[0] > 0.0)
+                loss_robust = bool(loss_scenarios.lower_relative_utility[0] > 0.0)
+                rank_admitted = bool(rank_gain > 0.002 and rank_robust)
+                loss_admitted = bool(
+                    loss_gain > 0.01
+                    and np.all(linear_fold_loss < constant_fold_loss)
+                    and loss_robust
+                    and rank_gain >= -0.001
+                )
+                selected = bool(accuracy_delta >= -0.002 and (rank_admitted or loss_admitted))
+                self._linear_leaf_tune_config = dict(resolved)
+                self._linear_leaf_tune_decision = selected
+                self.linear_leaf_report_ = [
+                    gate_report(
+                        "constant_leaf",
+                        not selected,
+                        stage="predictor",
+                        source="shared_final_tuning_rung",
+                        rank_auc=float(constant_rank),
+                        accuracy=float(constant_accuracy),
+                        mean_log_loss=float(constant_fold_loss.mean()),
+                    ),
+                    gate_report(
+                        "linear_leaf",
+                        selected,
+                        stage="predictor",
+                        source="shared_final_tuning_rung",
+                        rank_auc=float(linear_rank),
+                        accuracy=float(linear_accuracy),
+                        mean_log_loss=float(linear_fold_loss.mean()),
+                        rank_auc_gain=rank_gain,
+                        accuracy_delta=accuracy_delta,
+                        relative_log_loss_reduction=loss_gain,
+                        rank_scenario_robust=rank_robust,
+                        loss_scenario_robust=loss_robust,
+                        rank_scenarios=rank_scenarios.report(
+                            [1, 0],
+                            baseline_position=1,
+                            role="linear_leaf_rank_verifier",
+                        ),
+                        loss_scenarios=loss_scenarios.report(
+                            [1, 0],
+                            baseline_position=1,
+                            role="linear_leaf_log_loss_verifier",
+                        ),
+                    ),
+                ]
+            except (ValueError, FloatingPointError) as error:
+                self._linear_leaf_tune_config = dict(resolved)
+                self._linear_leaf_tune_decision = False
+                self.linear_leaf_report_ = [
+                    gate_report(
+                        "linear_leaf",
+                        False,
+                        stage="predictor",
+                        source="shared_final_tuning_rung",
+                        reason="scenario_evidence_failed_closed",
+                        error=type(error).__name__,
+                    )
+                ]
+        return resolved
 
     def _auto_rank_checkpoint_clf(self, X, y, boost):
         """Gate an AUC-selected prefix from the same transparent tree trace.
@@ -6870,6 +7606,68 @@ class TabPVN:
         }
         return selected_mapper
 
+    def _new_symbolic_predicate_map(self, **kwargs):
+        """Build the compiler while keeping research switches off the public API."""
+        from tabpvn.predicate_compiler import SymbolicPredicateMap
+
+        mapper = SymbolicPredicateMap(**kwargs)
+        if hasattr(mapper, "mdl_beam"):
+            mapper.mdl_beam = bool(getattr(self, "_symbolic_mdl_beam", True))
+        if hasattr(mapper, "mdl_dnf"):
+            mapper.mdl_dnf = bool(mapper.mdl_beam and getattr(self, "_symbolic_mdl_dnf", True))
+        if hasattr(mapper, "mdl_recursive_dnf"):
+            mapper.mdl_recursive_dnf = bool(
+                mapper.mdl_dnf and getattr(self, "_symbolic_mdl_recursive_dnf", True)
+            )
+        if hasattr(mapper, "mdl_exception"):
+            mapper.mdl_exception = bool(mapper.mdl_beam and getattr(self, "_symbolic_mdl_exception", True))
+        return mapper
+
+    @staticmethod
+    def _fit_symbolic_predicate_map(
+        mapper,
+        X,
+        y,
+        baseline_probability=None,
+        evidence_rows=None,
+    ):
+        """Supply residual codelength evidence only to compilers that support it."""
+        if getattr(mapper, "mdl_beam", False) and baseline_probability is not None:
+            return mapper.fit(
+                X,
+                y,
+                mdl_baseline_probability=baseline_probability,
+                mdl_evidence_rows=evidence_rows,
+            )
+        return mapper.fit(X, y)
+
+    @staticmethod
+    def _symbolic_program_subset(fitted_mapper, excluded_kinds):
+        """Return a transform-compatible view without selected program families."""
+        from copy import copy
+
+        subset = copy(fitted_mapper)
+        subset.predicates = [
+            predicate for predicate in fitted_mapper.predicates if predicate.kind not in excluded_kinds
+        ]
+        return subset
+
+    @classmethod
+    def _symbolic_program_layer(
+        cls,
+        fitted_mapper,
+        *,
+        recursive_selected,
+        exception_selected,
+    ):
+        """Materialize the highest incrementally verified symbolic layer."""
+        excluded = set()
+        if not recursive_selected:
+            excluded.add("binary_recursive_dnf")
+        if not exception_selected:
+            excluded.add("binary_exception")
+        return fitted_mapper if not excluded else cls._symbolic_program_subset(fitted_mapper, excluded)
+
     def _auto_interactions(self, X, y, boost):
         """Select a finite symbolic feature program only after a cross-fitted win.
 
@@ -6924,7 +7722,34 @@ class TabPVN:
         gate_cfg = dict(boost)
         gate_cfg["rounds"] = min(gate_cfg.get("rounds", 400), 300)
         gate_cfg["refit"] = False
-        base_scores, program_scores = [], []
+        base_scores, incumbent_scores, recursive_scores, exception_scores = [], [], [], []
+        base_evidence_probability = np.full(len(yg), np.nan, dtype=float)
+        search_mapper = None
+        recursive_candidate_seen = False
+        recursive_candidate_complete = True
+        exception_candidate_seen = False
+        exception_candidate_complete = True
+
+        def positive_probability(model, features):
+            scores = model._scores(features)
+            probabilities = np.exp(scores - scores.max(1, keepdims=True))
+            probabilities /= probabilities.sum(1, keepdims=True)
+            return probabilities[:, 1]
+
+        def fit_program(candidate_mapper, train_rows, train_groups):
+            mapped_train = candidate_mapper.transform(Xg[train_rows])
+            program_cfg = dict(gate_cfg)
+            if "allowed" in program_cfg:
+                program_cfg["allowed"] = tuple(program_cfg["allowed"]) + tuple(
+                    range(Xg.shape[1], mapped_train.shape[1])
+                )
+            return self._fit_certified(
+                self._classifier(**program_cfg),
+                mapped_train,
+                yg[train_rows],
+                groups=train_groups,
+            )
+
         try:
             splits = self._validation_splits(
                 yg,
@@ -6933,14 +7758,6 @@ class TabPVN:
                 groups=groups,
             )
             for tr, va in splits:
-                mapper = SymbolicPredicateMap(
-                    seed=self.seed,
-                    exclusive_groups=exclusive_groups,
-                    numeric_rules=numeric_rules,
-                ).fit(Xg[tr], yg[tr])
-                if not mapper.predicates:
-                    self.candidate_report_ = [gate_report("certified_boost", True, stage="predictor")]
-                    return None
                 train_groups = None if groups is None else groups[tr]
                 base = self._fit_certified(
                     self._classifier(**gate_cfg),
@@ -6948,41 +7765,173 @@ class TabPVN:
                     yg[tr],
                     groups=train_groups,
                 )
-                mapped_train = mapper.transform(Xg[tr])
-                program_cfg = dict(gate_cfg)
-                if "allowed" in program_cfg:
-                    program_cfg["allowed"] = tuple(program_cfg["allowed"]) + tuple(
-                        range(Xg.shape[1], mapped_train.shape[1])
-                    )
-                program = self._fit_certified(
-                    self._classifier(**program_cfg),
-                    mapped_train,
-                    yg[tr],
-                    groups=train_groups,
+                search_mapper = self._new_symbolic_predicate_map(
+                    seed=self.seed,
+                    exclusive_groups=exclusive_groups,
+                    numeric_rules=numeric_rules,
                 )
+                search_mapper = self._fit_symbolic_predicate_map(
+                    search_mapper,
+                    Xg[tr],
+                    yg[tr],
+                    positive_probability(base, Xg[tr]),
+                    getattr(base, "ver_", None),
+                )
+                if not search_mapper.predicates:
+                    self.candidate_report_ = [gate_report("certified_boost", True, stage="predictor")]
+                    return None
 
-                def auc(model, features, *, validation_rows=va):
-                    scores = model._scores(features)
-                    probs = np.exp(scores - scores.max(1, keepdims=True))
-                    probs /= probs.sum(1, keepdims=True)
-                    positive = model.classes_[1]
-                    return float(roc_auc_score(yg[validation_rows] == positive, probs[:, 1]))
+                base_probability = positive_probability(base, Xg[va])
+                base_evidence_probability[va] = base_probability
+                base_scores.append(float(roc_auc_score(yg[va] == base.classes_[1], base_probability)))
+                incumbent_mapper = self._symbolic_program_subset(
+                    search_mapper,
+                    {"binary_recursive_dnf", "binary_exception"},
+                )
+                if incumbent_mapper.predicates:
+                    incumbent_program = fit_program(incumbent_mapper, tr, train_groups)
+                    incumbent_probability = positive_probability(
+                        incumbent_program,
+                        incumbent_mapper.transform(Xg[va]),
+                    )
+                    incumbent_score = float(
+                        roc_auc_score(yg[va] == incumbent_program.classes_[1], incumbent_probability)
+                    )
+                else:
+                    incumbent_score = base_scores[-1]
+                incumbent_scores.append(incumbent_score)
 
-                base_scores.append(auc(base, Xg[va]))
-                program_scores.append(auc(program, mapper.transform(Xg[va])))
+                has_recursive_candidate = any(
+                    predicate.kind == "binary_recursive_dnf" for predicate in search_mapper.predicates
+                )
+                recursive_candidate_seen |= has_recursive_candidate
+                recursive_candidate_complete &= has_recursive_candidate
+                if has_recursive_candidate:
+                    recursive_mapper = self._symbolic_program_subset(
+                        search_mapper,
+                        {"binary_exception"},
+                    )
+                    recursive_program = fit_program(recursive_mapper, tr, train_groups)
+                    recursive_probability = positive_probability(
+                        recursive_program,
+                        recursive_mapper.transform(Xg[va]),
+                    )
+                    recursive_scores.append(
+                        float(
+                            roc_auc_score(
+                                yg[va] == recursive_program.classes_[1],
+                                recursive_probability,
+                            )
+                        )
+                    )
+                else:
+                    recursive_scores.append(incumbent_score)
+
+                has_exception_candidate = any(
+                    predicate.kind == "binary_exception" for predicate in search_mapper.predicates
+                )
+                exception_candidate_seen |= has_exception_candidate
+                exception_candidate_complete &= has_exception_candidate
+                if has_exception_candidate:
+                    exception_program = fit_program(search_mapper, tr, train_groups)
+                    exception_probability = positive_probability(
+                        exception_program,
+                        search_mapper.transform(Xg[va]),
+                    )
+                    exception_scores.append(
+                        float(
+                            roc_auc_score(
+                                yg[va] == exception_program.classes_[1],
+                                exception_probability,
+                            )
+                        )
+                    )
+                else:
+                    exception_scores.append(recursive_scores[-1])
         except Exception:
             # A default candidate must fail closed: any compiler or gate failure
             # leaves the verified baseline unchanged.
             self.candidate_report_ = [gate_report("certified_boost", True, stage="predictor")]
             return None
 
-        deltas = np.asarray(program_scores) - np.asarray(base_scores)
-        mapper = SymbolicPredicateMap(
-            seed=self.seed,
-            exclusive_groups=exclusive_groups,
-            numeric_rules=numeric_rules,
-        ).fit(Xg, yg)
-        selected = bool(mapper.predicates and np.all(deltas > 0.0) and float(deltas.mean()) >= 0.003)
+        base_scores = np.asarray(base_scores)
+        incumbent_scores = np.asarray(incumbent_scores)
+        recursive_scores = np.asarray(recursive_scores)
+        exception_scores = np.asarray(exception_scores)
+        incumbent_deltas = incumbent_scores - base_scores
+        incumbent_selected = bool(
+            search_mapper is not None
+            and len(incumbent_deltas)
+            and np.all(incumbent_deltas > 0.0)
+            and float(incumbent_deltas.mean()) >= 0.003
+        )
+        recursive_lower_scores = incumbent_scores if incumbent_selected else base_scores
+        recursive_deltas = recursive_scores - recursive_lower_scores
+        recursive_selected = bool(
+            getattr(self, "_symbolic_mdl_recursive_dnf", True)
+            and recursive_candidate_seen
+            and recursive_candidate_complete
+            and len(recursive_deltas)
+            and np.all(recursive_deltas > 0.0)
+            and float(recursive_deltas.mean()) >= 0.002
+        )
+        exception_lower_scores = (
+            recursive_scores
+            if recursive_selected
+            else incumbent_scores
+            if incumbent_selected
+            else base_scores
+        )
+        exception_deltas = exception_scores - exception_lower_scores
+        exception_selected = bool(
+            getattr(self, "_symbolic_mdl_exception", True)
+            and exception_candidate_seen
+            and exception_candidate_complete
+            and (not recursive_candidate_seen or recursive_selected)
+            and len(exception_deltas)
+            and np.all(exception_deltas > 0.0)
+            and float(exception_deltas.mean()) >= 0.002
+        )
+        selected_scores = (
+            exception_scores
+            if exception_selected
+            else recursive_scores
+            if recursive_selected
+            else incumbent_scores
+            if incumbent_selected
+            else base_scores
+        )
+        selected_deltas = selected_scores - base_scores
+        selected = bool(incumbent_selected or recursive_selected or exception_selected)
+        deploy_mapper = None
+        if selected:
+            full_mapper = self._new_symbolic_predicate_map(
+                seed=self.seed,
+                exclusive_groups=exclusive_groups,
+                numeric_rules=numeric_rules,
+            )
+            full_mapper = self._fit_symbolic_predicate_map(
+                full_mapper,
+                Xg,
+                yg,
+                (base_evidence_probability if np.isfinite(base_evidence_probability).all() else None),
+            )
+            if recursive_selected and not any(
+                predicate.kind == "binary_recursive_dnf" for predicate in full_mapper.predicates
+            ):
+                recursive_selected = False
+            if exception_selected and not any(
+                predicate.kind == "binary_exception" for predicate in full_mapper.predicates
+            ):
+                exception_selected = False
+            selected = bool(incumbent_selected or recursive_selected or exception_selected)
+            deploy_mapper = self._symbolic_program_layer(
+                full_mapper,
+                recursive_selected=recursive_selected,
+                exception_selected=exception_selected,
+            )
+            selected = bool(selected and deploy_mapper.predicates)
+        report_mapper = deploy_mapper if deploy_mapper is not None else search_mapper
         self.candidate_report_ = [
             gate_report(
                 "certified_boost",
@@ -6994,15 +7943,72 @@ class TabPVN:
                 "symbolic_predicate_boost",
                 selected,
                 stage="schema",
-                mean_auc=float(np.mean(program_scores)),
-                fold_auc_delta=[float(delta) for delta in deltas],
+                mean_auc=float(np.mean(selected_scores)),
+                fold_auc_delta=[float(delta) for delta in selected_deltas],
+                incumbent_selected=incumbent_selected,
+                recursive_dnf_selected=recursive_selected,
+                recursive_dnf_incremental_auc_delta=[float(delta) for delta in recursive_deltas],
+                exception_program_selected=exception_selected,
+                exception_program_incremental_auc_delta=[float(delta) for delta in exception_deltas],
                 evidence_rows=int(len(yg)),
                 source_rows=int(source_rows),
-                source_binary_columns=int(getattr(mapper, "source_binary_columns_", 0)),
-                screened_binary_columns=int(getattr(mapper, "screened_binary_columns_", 0)),
+                source_binary_columns=int(getattr(report_mapper, "source_binary_columns_", 0)),
+                screened_binary_columns=int(getattr(report_mapper, "screened_binary_columns_", 0)),
+                mdl_search_enabled=bool(getattr(report_mapper, "mdl_beam", False)),
+                mdl_candidates_evaluated=int(getattr(report_mapper, "mdl_candidates_evaluated_", 0)),
+                mdl_predicates=int(getattr(report_mapper, "mdl_predicates_selected_", 0)),
+                mdl_dnf_search_enabled=bool(getattr(report_mapper, "mdl_dnf", False)),
+                mdl_dnf_candidates_evaluated=int(getattr(report_mapper, "mdl_dnf_candidates_evaluated_", 0)),
+                mdl_dnf_predicates=int(getattr(report_mapper, "mdl_dnf_predicates_selected_", 0)),
+                mdl_recursive_dnf_search_enabled=bool(getattr(report_mapper, "mdl_recursive_dnf", False)),
+                mdl_recursive_dnf_candidates_evaluated=int(
+                    getattr(report_mapper, "mdl_recursive_dnf_candidates_evaluated_", 0)
+                ),
+                mdl_recursive_dnf_predicates=int(
+                    getattr(report_mapper, "mdl_recursive_dnf_predicates_selected_", 0)
+                ),
+                mdl_exception_search_enabled=bool(getattr(report_mapper, "mdl_exception", False)),
+                mdl_exception_clause_candidates_evaluated=int(
+                    getattr(report_mapper, "mdl_exception_clause_candidates_evaluated_", 0)
+                ),
+                mdl_exception_candidates_evaluated=int(
+                    getattr(report_mapper, "mdl_exception_candidates_evaluated_", 0)
+                ),
+                mdl_exception_predicates=int(getattr(report_mapper, "mdl_exception_predicates_selected_", 0)),
+                mdl_objective=getattr(report_mapper, "mdl_search_objective_", None),
+                mdl_evidence_rows=int(getattr(report_mapper, "mdl_evidence_rows_", 0)),
+                mdl_source_evidence_rows=int(getattr(report_mapper, "mdl_source_evidence_rows_", 0)),
+                mdl_evidence_capped=bool(getattr(report_mapper, "mdl_evidence_capped_", False)),
+                mdl_net_bits=[
+                    float(row["net_mdl_bits"]) for row in getattr(report_mapper, "mdl_program_report_", ())
+                ],
+            ),
+            gate_report(
+                "mdl_recursive_dnf",
+                recursive_selected,
+                stage="schema",
+                mean_auc=float(np.mean(recursive_scores)),
+                fold_auc_delta=[float(delta) for delta in recursive_deltas],
+                candidate_seen=recursive_candidate_seen,
+                compared_against=("symbolic_incumbent" if incumbent_selected else "certified_boost"),
+            ),
+            gate_report(
+                "mdl_exception_program",
+                exception_selected,
+                stage="schema",
+                mean_auc=float(np.mean(exception_scores)),
+                fold_auc_delta=[float(delta) for delta in exception_deltas],
+                candidate_seen=exception_candidate_seen,
+                compared_against=(
+                    "mdl_recursive_dnf"
+                    if recursive_selected
+                    else "symbolic_incumbent"
+                    if incumbent_selected
+                    else "certified_boost"
+                ),
             ),
         ]
-        return mapper if selected else None
+        return deploy_mapper if selected else None
 
     def _auto_threshold_interactions(
         self,
@@ -7023,21 +8029,46 @@ class TabPVN:
         """
         from sklearn.metrics import roc_auc_score
 
-        from tabpvn.predicate_compiler import SymbolicPredicateMap
-
         min_fold_gain = 0.002
         gate_cfg = dict(boost)
         gate_cfg["rounds"] = min(gate_cfg.get("rounds", 400), 300)
         gate_cfg["refit"] = False
-        base_scores, binary_scores, threshold_scores = [], [], []
+        base_scores, binary_scores, recursive_scores, exception_scores = [], [], [], []
+        threshold_scores, recursive_threshold_scores, exception_threshold_scores = [], [], []
         binary_complete = threshold_complete = True
+        recursive_complete = recursive_threshold_complete = True
+        exception_complete = exception_threshold_complete = True
+        recursive_candidate_seen = False
+        exception_candidate_seen = False
+        base_evidence_probability = np.full(len(y), np.nan, dtype=float)
+
+        def positive_probability(model, features):
+            scores = model._scores(features)
+            probabilities = np.exp(scores - scores.max(1, keepdims=True))
+            probabilities /= probabilities.sum(1, keepdims=True)
+            return probabilities[:, 1]
 
         def auc(model, features, labels):
-            scores = model._scores(features)
-            probs = np.exp(scores - scores.max(1, keepdims=True))
-            probs /= probs.sum(1, keepdims=True)
-            positive = model.classes_[1]
-            return float(roc_auc_score(labels == positive, probs[:, 1]))
+            return float(
+                roc_auc_score(
+                    labels == model.classes_[1],
+                    positive_probability(model, features),
+                )
+            )
+
+        def fit_program(candidate_mapper, train_rows, train_groups):
+            mapped_train = candidate_mapper.transform(X[train_rows])
+            program_cfg = dict(gate_cfg)
+            if "allowed" in program_cfg:
+                program_cfg["allowed"] = tuple(program_cfg["allowed"]) + tuple(
+                    range(X.shape[1], mapped_train.shape[1])
+                )
+            return self._fit_certified(
+                self._classifier(**program_cfg),
+                mapped_train,
+                y[train_rows],
+                groups=train_groups,
+            )
 
         try:
             splits = self._validation_splits(
@@ -7054,36 +8085,78 @@ class TabPVN:
                     y[tr],
                     groups=train_groups,
                 )
-                base_scores.append(auc(base, X[va], y[va]))
+                base_train_probability = positive_probability(base, X[tr])
+                base_evidence_probability[va] = positive_probability(base, X[va])
+                base_scores.append(
+                    float(
+                        roc_auc_score(
+                            y[va] == base.classes_[1],
+                            base_evidence_probability[va],
+                        )
+                    )
+                )
 
-                binary_mapper = SymbolicPredicateMap(
+                binary_mapper = self._new_symbolic_predicate_map(
                     seed=self.seed,
                     exclusive_groups=exclusive_groups,
-                ).fit(X[tr], y[tr])
-                if binary_complete and binary_mapper.predicates:
-                    binary_train = binary_mapper.transform(X[tr])
-                    binary_cfg = dict(gate_cfg)
-                    if "allowed" in binary_cfg:
-                        binary_cfg["allowed"] = tuple(binary_cfg["allowed"]) + tuple(
-                            range(X.shape[1], binary_train.shape[1])
-                        )
-                    binary = self._fit_certified(
-                        self._classifier(**binary_cfg),
-                        binary_train,
-                        y[tr],
-                        groups=train_groups,
-                    )
-                    binary_scores.append(auc(binary, binary_mapper.transform(X[va]), y[va]))
+                )
+                binary_mapper = self._fit_symbolic_predicate_map(
+                    binary_mapper,
+                    X[tr],
+                    y[tr],
+                    base_train_probability,
+                    getattr(base, "ver_", None),
+                )
+                binary_incumbent = self._symbolic_program_subset(
+                    binary_mapper,
+                    {"binary_recursive_dnf", "binary_exception"},
+                )
+                if binary_complete and binary_incumbent.predicates:
+                    binary = fit_program(binary_incumbent, tr, train_groups)
+                    binary_scores.append(auc(binary, binary_incumbent.transform(X[va]), y[va]))
                 else:
                     binary_complete = False
 
+                has_recursive = any(
+                    predicate.kind == "binary_recursive_dnf" for predicate in binary_mapper.predicates
+                )
+                recursive_candidate_seen |= has_recursive
+                recursive_complete &= has_recursive and binary_complete
+                if has_recursive and binary_complete:
+                    recursive_mapper = self._symbolic_program_subset(
+                        binary_mapper,
+                        {"binary_exception"},
+                    )
+                    recursive = fit_program(recursive_mapper, tr, train_groups)
+                    recursive_scores.append(auc(recursive, recursive_mapper.transform(X[va]), y[va]))
+                elif binary_scores:
+                    recursive_scores.append(binary_scores[-1])
+
+                has_exception = any(
+                    predicate.kind == "binary_exception" for predicate in binary_mapper.predicates
+                )
+                exception_candidate_seen |= has_exception
+                exception_complete &= has_exception and binary_complete
+                if has_exception and binary_complete:
+                    exception = fit_program(binary_mapper, tr, train_groups)
+                    exception_scores.append(auc(exception, binary_mapper.transform(X[va]), y[va]))
+                elif recursive_scores:
+                    exception_scores.append(recursive_scores[-1])
+
                 if threshold_complete:
                     try:
-                        threshold_mapper = SymbolicPredicateMap(
+                        threshold_mapper = self._new_symbolic_predicate_map(
                             seed=self.seed,
                             exclusive_groups=exclusive_groups,
                             numeric_rules=True,
-                        ).fit(X[tr], y[tr])
+                        )
+                        threshold_mapper = self._fit_symbolic_predicate_map(
+                            threshold_mapper,
+                            X[tr],
+                            y[tr],
+                            base_train_probability,
+                            getattr(base, "ver_", None),
+                        )
                         has_threshold = any(
                             predicate.kind.startswith("threshold_")
                             for predicate in threshold_mapper.predicates
@@ -7091,31 +8164,80 @@ class TabPVN:
                         if not has_threshold:
                             threshold_complete = False
                             continue
-                        threshold_train = threshold_mapper.transform(X[tr])
-                        threshold_cfg = dict(gate_cfg)
-                        if "allowed" in threshold_cfg:
-                            threshold_cfg["allowed"] = tuple(threshold_cfg["allowed"]) + tuple(
-                                range(X.shape[1], threshold_train.shape[1])
-                            )
-                        threshold = self._fit_certified(
-                            self._classifier(**threshold_cfg),
-                            threshold_train,
-                            y[tr],
-                            groups=train_groups,
+                        threshold_incumbent = self._symbolic_program_subset(
+                            threshold_mapper,
+                            {"binary_recursive_dnf", "binary_exception"},
                         )
-                        threshold_scores.append(auc(threshold, threshold_mapper.transform(X[va]), y[va]))
+                        threshold = fit_program(threshold_incumbent, tr, train_groups)
+                        threshold_scores.append(auc(threshold, threshold_incumbent.transform(X[va]), y[va]))
+
+                        has_recursive_threshold = any(
+                            predicate.kind == "binary_recursive_dnf"
+                            for predicate in threshold_mapper.predicates
+                        )
+                        recursive_threshold_complete &= has_recursive_threshold
+                        if has_recursive_threshold:
+                            recursive_threshold_mapper = self._symbolic_program_subset(
+                                threshold_mapper,
+                                {"binary_exception"},
+                            )
+                            recursive_threshold = fit_program(
+                                recursive_threshold_mapper,
+                                tr,
+                                train_groups,
+                            )
+                            recursive_threshold_scores.append(
+                                auc(
+                                    recursive_threshold,
+                                    recursive_threshold_mapper.transform(X[va]),
+                                    y[va],
+                                )
+                            )
+                        else:
+                            recursive_threshold_scores.append(threshold_scores[-1])
+
+                        has_exception_threshold = any(
+                            predicate.kind == "binary_exception" for predicate in threshold_mapper.predicates
+                        )
+                        exception_threshold_complete &= has_exception_threshold
+                        if has_exception_threshold:
+                            exception_threshold = fit_program(threshold_mapper, tr, train_groups)
+                            exception_threshold_scores.append(
+                                auc(
+                                    exception_threshold,
+                                    threshold_mapper.transform(X[va]),
+                                    y[va],
+                                )
+                            )
+                        else:
+                            exception_threshold_scores.append(recursive_threshold_scores[-1])
                     except Exception:
                         # The augmentation fails closed while the lower binary
                         # layer remains independently eligible for deployment.
                         threshold_complete = False
+                        recursive_threshold_complete = False
+                        exception_threshold_complete = False
         except Exception:
             self.candidate_report_ = [gate_report("certified_boost", True, stage="predictor")]
             return None
 
-        full_binary = SymbolicPredicateMap(
+        final_baseline_probability = (
+            base_evidence_probability if np.isfinite(base_evidence_probability).all() else None
+        )
+        full_binary_search = self._new_symbolic_predicate_map(
             seed=self.seed,
             exclusive_groups=exclusive_groups,
-        ).fit(X, y)
+        )
+        full_binary_search = self._fit_symbolic_predicate_map(
+            full_binary_search,
+            X,
+            y,
+            final_baseline_probability,
+        )
+        full_binary_incumbent = self._symbolic_program_subset(
+            full_binary_search,
+            {"binary_recursive_dnf", "binary_exception"},
+        )
         binary_complete = binary_complete and len(binary_scores) == len(base_scores)
         binary_deltas = (
             np.asarray(binary_scores) - np.asarray(base_scores)
@@ -7123,33 +8245,113 @@ class TabPVN:
             else np.asarray([], dtype=float)
         )
         binary_selected = bool(
-            full_binary.predicates
+            full_binary_incumbent.predicates
             and len(binary_deltas)
             and np.all(binary_deltas > 0.0)
             and float(binary_deltas.mean()) >= 0.003
         )
+        recursive_complete = recursive_complete and len(recursive_scores) == len(base_scores)
+        recursive_lower_scores = binary_scores if binary_selected else base_scores
+        recursive_deltas = (
+            np.asarray(recursive_scores) - np.asarray(recursive_lower_scores)
+            if recursive_complete
+            else np.asarray([], dtype=float)
+        )
+        recursive_selected = bool(
+            getattr(self, "_symbolic_mdl_recursive_dnf", True)
+            and recursive_candidate_seen
+            and any(predicate.kind == "binary_recursive_dnf" for predicate in full_binary_search.predicates)
+            and len(recursive_deltas)
+            and np.all(recursive_deltas > 0.0)
+            and float(recursive_deltas.mean()) >= min_fold_gain
+        )
+        exception_complete = exception_complete and len(exception_scores) == len(base_scores)
+        exception_lower_scores = recursive_scores if recursive_selected else recursive_lower_scores
+        exception_deltas = (
+            np.asarray(exception_scores) - np.asarray(exception_lower_scores)
+            if exception_complete
+            else np.asarray([], dtype=float)
+        )
+        exception_selected = bool(
+            getattr(self, "_symbolic_mdl_exception", True)
+            and exception_candidate_seen
+            and (not recursive_candidate_seen or recursive_selected)
+            and any(predicate.kind == "binary_exception" for predicate in full_binary_search.predicates)
+            and len(exception_deltas)
+            and np.all(exception_deltas > 0.0)
+            and float(exception_deltas.mean()) >= min_fold_gain
+        )
+        full_binary = self._symbolic_program_layer(
+            full_binary_search,
+            recursive_selected=recursive_selected,
+            exception_selected=exception_selected,
+        )
+        binary_stage_selected = bool(binary_selected or recursive_selected or exception_selected)
+        selected_binary_scores = (
+            exception_scores
+            if exception_selected
+            else recursive_scores
+            if recursive_selected
+            else binary_scores
+        )
+        selected_binary_deltas = (
+            np.asarray(selected_binary_scores) - np.asarray(base_scores)
+            if len(selected_binary_scores) == len(base_scores)
+            else np.asarray([], dtype=float)
+        )
 
         try:
-            full_threshold = SymbolicPredicateMap(
+            full_threshold_search = self._new_symbolic_predicate_map(
                 seed=self.seed,
                 exclusive_groups=exclusive_groups,
                 numeric_rules=True,
-            ).fit(X, y)
+            )
+            full_threshold_search = self._fit_symbolic_predicate_map(
+                full_threshold_search,
+                X,
+                y,
+                final_baseline_probability,
+            )
+            full_threshold = self._symbolic_program_layer(
+                full_threshold_search,
+                recursive_selected=recursive_selected,
+                exception_selected=exception_selected,
+            )
             has_full_threshold = any(
                 predicate.kind.startswith("threshold_") for predicate in full_threshold.predicates
             )
+            if recursive_selected and not any(
+                predicate.kind == "binary_recursive_dnf" for predicate in full_threshold.predicates
+            ):
+                has_full_threshold = False
+            if exception_selected and not any(
+                predicate.kind == "binary_exception" for predicate in full_threshold.predicates
+            ):
+                has_full_threshold = False
         except Exception:
             full_threshold = full_binary
             has_full_threshold = threshold_complete = False
-        threshold_complete = threshold_complete and len(threshold_scores) == len(base_scores)
+        active_threshold_scores = (
+            exception_threshold_scores
+            if exception_selected
+            else recursive_threshold_scores
+            if recursive_selected
+            else threshold_scores
+        )
+        threshold_complete = bool(
+            threshold_complete
+            and len(active_threshold_scores) == len(base_scores)
+            and (not recursive_selected or recursive_threshold_complete)
+            and (not exception_selected or exception_threshold_complete)
+        )
         threshold_deltas = (
-            np.asarray(threshold_scores) - np.asarray(base_scores)
+            np.asarray(active_threshold_scores) - np.asarray(base_scores)
             if threshold_complete
             else np.asarray([], dtype=float)
         )
-        lower_scores = binary_scores if binary_selected else base_scores
+        lower_scores = selected_binary_scores if binary_stage_selected else base_scores
         incremental_deltas = (
-            np.asarray(threshold_scores) - np.asarray(lower_scores)
+            np.asarray(active_threshold_scores) - np.asarray(lower_scores)
             if threshold_complete
             else np.asarray([], dtype=float)
         )
@@ -7162,7 +8364,9 @@ class TabPVN:
             and float(incremental_deltas.mean()) >= 0.003
         )
 
-        selected_mapper = full_threshold if threshold_selected else full_binary if binary_selected else None
+        selected_mapper = (
+            full_threshold if threshold_selected else full_binary if binary_stage_selected else None
+        )
         self.candidate_report_ = [
             gate_report(
                 "certified_boost",
@@ -7172,18 +8376,111 @@ class TabPVN:
             ),
             gate_report(
                 "symbolic_predicate_boost",
-                binary_selected,
+                binary_stage_selected,
                 stage="schema",
-                mean_auc=float(np.mean(binary_scores)) if binary_complete else float("nan"),
-                fold_auc_delta=[float(delta) for delta in binary_deltas],
+                mean_auc=(
+                    float(np.mean(selected_binary_scores))
+                    if len(selected_binary_scores) == len(base_scores)
+                    else float("nan")
+                ),
+                fold_auc_delta=[float(delta) for delta in selected_binary_deltas],
+                incumbent_selected=binary_selected,
+                recursive_dnf_selected=recursive_selected,
+                recursive_dnf_incremental_auc_delta=[float(delta) for delta in recursive_deltas],
+                exception_program_selected=exception_selected,
+                exception_program_incremental_auc_delta=[float(delta) for delta in exception_deltas],
+                mdl_search_enabled=bool(getattr(full_binary, "mdl_beam", False)),
+                mdl_candidates_evaluated=int(getattr(full_binary, "mdl_candidates_evaluated_", 0)),
+                mdl_predicates=int(getattr(full_binary, "mdl_predicates_selected_", 0)),
+                mdl_dnf_search_enabled=bool(getattr(full_binary, "mdl_dnf", False)),
+                mdl_dnf_candidates_evaluated=int(getattr(full_binary, "mdl_dnf_candidates_evaluated_", 0)),
+                mdl_dnf_predicates=int(getattr(full_binary, "mdl_dnf_predicates_selected_", 0)),
+                mdl_recursive_dnf_search_enabled=bool(getattr(full_binary, "mdl_recursive_dnf", False)),
+                mdl_recursive_dnf_candidates_evaluated=int(
+                    getattr(full_binary, "mdl_recursive_dnf_candidates_evaluated_", 0)
+                ),
+                mdl_recursive_dnf_predicates=int(
+                    getattr(full_binary, "mdl_recursive_dnf_predicates_selected_", 0)
+                ),
+                mdl_exception_search_enabled=bool(getattr(full_binary, "mdl_exception", False)),
+                mdl_exception_clause_candidates_evaluated=int(
+                    getattr(full_binary, "mdl_exception_clause_candidates_evaluated_", 0)
+                ),
+                mdl_exception_candidates_evaluated=int(
+                    getattr(full_binary, "mdl_exception_candidates_evaluated_", 0)
+                ),
+                mdl_exception_predicates=int(getattr(full_binary, "mdl_exception_predicates_selected_", 0)),
+                mdl_objective=getattr(full_binary, "mdl_search_objective_", None),
+                mdl_evidence_rows=int(getattr(full_binary, "mdl_evidence_rows_", 0)),
+                mdl_source_evidence_rows=int(getattr(full_binary, "mdl_source_evidence_rows_", 0)),
+                mdl_evidence_capped=bool(getattr(full_binary, "mdl_evidence_capped_", False)),
+            ),
+            gate_report(
+                "mdl_recursive_dnf",
+                recursive_selected,
+                stage="schema",
+                mean_auc=(
+                    float(np.mean(recursive_scores))
+                    if len(recursive_scores) == len(base_scores)
+                    else float("nan")
+                ),
+                fold_auc_delta=[float(delta) for delta in recursive_deltas],
+                candidate_seen=recursive_candidate_seen,
+                compared_against=("symbolic_incumbent" if binary_selected else "certified_boost"),
+            ),
+            gate_report(
+                "mdl_exception_program",
+                exception_selected,
+                stage="schema",
+                mean_auc=(
+                    float(np.mean(exception_scores))
+                    if len(exception_scores) == len(base_scores)
+                    else float("nan")
+                ),
+                fold_auc_delta=[float(delta) for delta in exception_deltas],
+                candidate_seen=exception_candidate_seen,
+                compared_against=(
+                    "mdl_recursive_dnf"
+                    if recursive_selected
+                    else "symbolic_incumbent"
+                    if binary_selected
+                    else "certified_boost"
+                ),
             ),
             gate_report(
                 "threshold_predicate_boost",
                 threshold_selected,
                 stage="schema",
-                mean_auc=(float(np.mean(threshold_scores)) if threshold_complete else float("nan")),
+                mean_auc=(float(np.mean(active_threshold_scores)) if threshold_complete else float("nan")),
                 fold_auc_delta=[float(delta) for delta in threshold_deltas],
                 incremental_auc_delta=[float(delta) for delta in incremental_deltas],
+                mdl_search_enabled=bool(getattr(full_threshold, "mdl_beam", False)),
+                mdl_candidates_evaluated=int(getattr(full_threshold, "mdl_candidates_evaluated_", 0)),
+                mdl_predicates=int(getattr(full_threshold, "mdl_predicates_selected_", 0)),
+                mdl_dnf_search_enabled=bool(getattr(full_threshold, "mdl_dnf", False)),
+                mdl_dnf_candidates_evaluated=int(getattr(full_threshold, "mdl_dnf_candidates_evaluated_", 0)),
+                mdl_dnf_predicates=int(getattr(full_threshold, "mdl_dnf_predicates_selected_", 0)),
+                mdl_recursive_dnf_search_enabled=bool(getattr(full_threshold, "mdl_recursive_dnf", False)),
+                mdl_recursive_dnf_candidates_evaluated=int(
+                    getattr(full_threshold, "mdl_recursive_dnf_candidates_evaluated_", 0)
+                ),
+                mdl_recursive_dnf_predicates=int(
+                    getattr(full_threshold, "mdl_recursive_dnf_predicates_selected_", 0)
+                ),
+                mdl_exception_search_enabled=bool(getattr(full_threshold, "mdl_exception", False)),
+                mdl_exception_clause_candidates_evaluated=int(
+                    getattr(full_threshold, "mdl_exception_clause_candidates_evaluated_", 0)
+                ),
+                mdl_exception_candidates_evaluated=int(
+                    getattr(full_threshold, "mdl_exception_candidates_evaluated_", 0)
+                ),
+                mdl_exception_predicates=int(
+                    getattr(full_threshold, "mdl_exception_predicates_selected_", 0)
+                ),
+                mdl_objective=getattr(full_threshold, "mdl_search_objective_", None),
+                mdl_evidence_rows=int(getattr(full_threshold, "mdl_evidence_rows_", 0)),
+                mdl_source_evidence_rows=int(getattr(full_threshold, "mdl_source_evidence_rows_", 0)),
+                mdl_evidence_capped=bool(getattr(full_threshold, "mdl_evidence_capped_", False)),
             ),
         ]
         return selected_mapper
@@ -7383,6 +8680,7 @@ class TabPVN:
                 "max_leaves",
                 "best_first_pair",
                 "adaptive_best_first_pair",
+                "verifier_gated_pair_growth",
                 "coupled_pair_growth",
                 "honest_pair_growth",
                 "allowed",
@@ -7995,15 +9293,28 @@ class TabPVN:
             # The OOF gate evaluated category evidence after the projected
             # smooth read, so reproduce that exact certified-class geometry.
             p = _preserve_certified_class(certified, p)
-            p = (1.0 - self._category_memory_w) * p + self._category_memory_w * self._category_memory.proba(X)
+            expert = self._category_memory.proba(X)
+            candidate = _preserve_certified_class(
+                p,
+                (1.0 - self._category_memory_w) * p + self._category_memory_w * expert,
+            )
+            router = getattr(self, "_category_memory_router", None)
+            p = candidate if router is None else router.apply(p, expert, candidate)
         if getattr(self, "_proof_path_memory", None) is not None:
             # The path gate challenges the residual geometry after the local
             # and categorical members, matching the OOF composition above.
-            p = _preserve_certified_class(
-                certified,
-                (1.0 - self._proof_path_memory_w) * p
-                + self._proof_path_memory_w * self._proof_path_memory.proba(X),
+            mode = getattr(self, "_proof_path_memory_mode", "local_vote")
+            expert = (
+                self._proof_path_memory.hierarchical_proba(X)
+                if mode == "hierarchical_posterior"
+                else self._proof_path_memory.proba(X)
             )
+            candidate = _preserve_certified_class(
+                p,
+                (1.0 - self._proof_path_memory_w) * p + self._proof_path_memory_w * expert,
+            )
+            router = getattr(self, "_proof_path_memory_router", None)
+            p = candidate if router is None else router.apply(p, expert, candidate)
         if getattr(self, "_sdm", None) is not None:  # SDM-attention read over the token vectors (graded text)
             p = (1.0 - self._sdm_w) * p + self._sdm_w * self._sdm.proba(X)
         p = _preserve_certified_class(certified, p)

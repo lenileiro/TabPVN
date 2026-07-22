@@ -3315,6 +3315,70 @@ def _multiclass_ovo_auc(scores, target, sample_weight=None):
     return float(np.mean(pair_scores)) if pair_scores else 0.5
 
 
+_PAIR_EXPERT_SCORE_TOLERANCE = 1e-6
+_PAIR_EXPERT_RANK_TOLERANCE = 1e-6
+_PAIR_EXPERT_AUDITION_ROUNDS = 4
+_PAIR_EXPERT_MAX_TOTAL_AUDITIONS = 8
+
+
+def _multiclass_log_score(scores, target, sample_weight=None):
+    """Return negative multiclass log-loss, so larger is the better proper score."""
+    scores = np.asarray(scores, dtype=float)
+    target = np.asarray(target, dtype=np.int64)
+    if scores.ndim != 2 or len(scores) != len(target):
+        raise ValueError("multiclass scores must have one row per target")
+    weights = None if sample_weight is None else np.asarray(sample_weight, dtype=float)
+    if weights is not None and len(weights) != len(target):
+        raise ValueError("sample_weight must have one value per target")
+    probability = np.clip(_softmax(scores), 1e-9, 1.0)
+    loss = -np.log(probability[np.arange(len(target)), target])
+    return -float(loss.mean() if weights is None else np.average(loss, weights=weights))
+
+
+def _select_multiclass_pair_expert(baseline_scores, expert_scores, target, sample_weight=None):
+    """Select extra pair capacity only for a proper-score gain without a rank regression."""
+    baseline_scores = np.asarray(baseline_scores, dtype=float)
+    expert_scores = np.asarray(expert_scores, dtype=float)
+    if baseline_scores.shape != expert_scores.shape:
+        raise ValueError("baseline and expert scores must have the same shape")
+    target = np.asarray(target, dtype=np.int64)
+    baseline_log_score = _multiclass_log_score(baseline_scores, target, sample_weight)
+    expert_log_score = _multiclass_log_score(expert_scores, target, sample_weight)
+    log_score_delta = expert_log_score - baseline_log_score
+    rank_guarded = np.unique(target).size == baseline_scores.shape[1]
+    baseline_rank_score = (
+        _multiclass_ovo_auc(baseline_scores, target, sample_weight) if rank_guarded else None
+    )
+    expert_rank_score = (
+        _multiclass_ovo_auc(expert_scores, target, sample_weight) if rank_guarded else None
+    )
+    rank_score_delta = (
+        None if baseline_rank_score is None else expert_rank_score - baseline_rank_score
+    )
+    proper_score_gain = log_score_delta > _PAIR_EXPERT_SCORE_TOLERANCE
+    rank_preserved = rank_score_delta is None or rank_score_delta >= -_PAIR_EXPERT_RANK_TOLERANCE
+    selected = bool(proper_score_gain and rank_preserved)
+    reason = (
+        "proper_score_not_improved"
+        if not proper_score_gain
+        else ("rank_guard_failed" if not rank_preserved else "proper_score_gain")
+    )
+    return selected, {
+        "selected": selected,
+        "reason": reason,
+        "proper_score": "negative_log_loss",
+        "baseline_proper_score": float(baseline_log_score),
+        "expert_proper_score": float(expert_log_score),
+        "proper_score_delta": float(log_score_delta),
+        "rank_guarded": bool(rank_guarded),
+        "baseline_rank_score": (
+            None if baseline_rank_score is None else float(baseline_rank_score)
+        ),
+        "expert_rank_score": None if expert_rank_score is None else float(expert_rank_score),
+        "rank_score_delta": None if rank_score_delta is None else float(rank_score_delta),
+    }
+
+
 def _fit_verifier_split(
     y,
     holdout,
@@ -3403,6 +3467,63 @@ def _fit_verifier_split(
     return fit, ver
 
 
+def _fit_checkpoint_calibration_split(
+    y,
+    holdout,
+    seed,
+    *,
+    stratified=False,
+    min_verifier_events=0,
+    validation_groups=None,
+    independent_calibration=False,
+):
+    """Reserve label-disjoint checkpoint and calibration evidence.
+
+    The checkpoint verifier may choose the deployed tree prefix, so its labels
+    cannot also calibrate confidence.  At scale, split the ordinary holdout in
+    two: the first part selects the checkpoint and the second remains untouched
+    until calibration.  If either class cannot be represented on both sides,
+    return no calibration rows and let the caller use cross-fitting instead.
+    """
+    required_events = int(min_verifier_events) * (2 if independent_calibration else 1)
+    fit, held_out = _fit_verifier_split(
+        y,
+        holdout,
+        seed,
+        stratified=stratified,
+        min_verifier_events=required_events,
+        validation_groups=validation_groups,
+    )
+    if not independent_calibration:
+        return fit, held_out, None
+
+    held_out = np.asarray(held_out, dtype=np.int64)
+    held_out_y = np.asarray(y, dtype=np.int64)[held_out]
+    _classes, counts = np.unique(held_out_y, return_counts=True)
+    if len(counts) < 2 or np.any(counts < 2):
+        return fit, held_out, None
+
+    held_out_groups = (
+        None
+        if validation_groups is None
+        else np.asarray(validation_groups, dtype=np.int64)[held_out]
+    )
+    try:
+        checkpoint_local, calibration_local = _fit_verifier_split(
+            held_out_y,
+            0.5,
+            seed + 104_729,
+            stratified=True,
+            min_verifier_events=min_verifier_events,
+            validation_groups=held_out_groups,
+        )
+    except ValueError:
+        return fit, held_out, None
+    if not len(checkpoint_local) or not len(calibration_local):
+        return fit, held_out, None
+    return fit, held_out[checkpoint_local], held_out[calibration_local]
+
+
 def _prior_preserving_subset_weight(y, sample_weight, rows):
     """Weight a stratified subset back to the full fitted class prior.
 
@@ -3462,6 +3583,7 @@ def _reason_boost_binary_symmetric(  # noqa: C901 - binary boost training loop
     track_validation_metrics=(),
     allowed=None,
     validation_groups=None,
+    independent_calibration=False,
 ):
     """Binary numeric softmax boosting in one margin with mirrored proof trees.
 
@@ -3471,13 +3593,14 @@ def _reason_boost_binary_symmetric(  # noqa: C901 - binary boost training loop
     while one scalar margin is sufficient for subsequent probabilities and
     validation loss.
     """
-    fit, ver = _fit_verifier_split(
+    fit, ver, calibration = _fit_checkpoint_calibration_split(
         yi,
         holdout,
         seed,
         stratified=stratified_holdout,
         min_verifier_events=min_verifier_events,
         validation_groups=validation_groups,
+        independent_calibration=independent_calibration and not refit,
     )
     Xf, yf, Xv, yv = X[fit], yi[fit], X[ver], yi[ver]
     source_weight = None if sample_weight is None else np.asarray(sample_weight, dtype=float)
@@ -3590,15 +3713,16 @@ def _reason_boost_binary_symmetric(  # noqa: C901 - binary boost training loop
         if all(bad_rounds[metric] >= patience for metric in metrics):
             break
     keep = keeps[validation_metric]
-    trace = None
+    return_trace = bool(track_validation_metrics)
+    trace = {} if return_trace else None
     if track_validation_metrics:
         trace_keep = max(keeps.values(), default=0)
-        trace = {
-            "trees": trees[:trace_keep],
-            "flats": flats[:trace_keep],
-            "tree_counts": dict(keeps),
-            "scores": dict(best_scores),
-        }
+        trace.update(
+            trees=trees[:trace_keep],
+            flats=flats[:trace_keep],
+            tree_counts=dict(keeps),
+            scores=dict(best_scores),
+        )
     if not refit or keep == 0:
         result = (
             base,
@@ -3606,10 +3730,10 @@ def _reason_boost_binary_symmetric(  # noqa: C901 - binary boost training loop
             trees[:keep],
             classes,
             flats[:keep],
-            (ver if not refit else None),
+            ((calibration if independent_calibration else ver) if not refit else None),
             False,
         )
-        return (*result, trace) if track_validation_metrics else result
+        return (*result, trace) if return_trace else result
 
     rounds_kept = keep // 2
     Xb_all, edges_all, NB_all = _prebin(X, nbins)
@@ -3667,7 +3791,8 @@ def _reason_boost_binary_symmetric(  # noqa: C901 - binary boost training loop
         flats.append(flat)
         trees.append((1, _negate_tree_values(tree)))
         flats.append(_negate_flat_values(flat))
-    return (base, lr, trees, classes, flats, None, False)
+    result = (base, lr, trees, classes, flats, None, False)
+    return (*result, trace) if return_trace else result
 
 
 def reason_boost_softmax(  # noqa: C901 - multiclass boost training loop
@@ -3701,6 +3826,7 @@ def reason_boost_softmax(  # noqa: C901 - multiclass boost training loop
     max_leaves=None,
     best_first_pair=False,
     adaptive_best_first_pair=False,
+    verifier_gated_pair_growth=False,
     coupled_pair_growth=False,
     honest_pair_growth=False,
     validation_metric="logloss",
@@ -3709,6 +3835,7 @@ def reason_boost_softmax(  # noqa: C901 - multiclass boost training loop
     feature_count=None,
     allowed=None,
     validation_groups=None,
+    independent_calibration=False,
 ):
     """MULTINOMIAL (softmax) gradient boosting — the coupled many-class fix for one-vs-rest. Each round
     fits one CART tree per class to the softmax residual (y_onehot - softmax(F)); Newton leaves use the
@@ -3753,6 +3880,8 @@ def reason_boost_softmax(  # noqa: C901 - multiclass boost training loop
         )
     if adaptive_best_first_pair and not best_first_pair:
         raise ValueError("adaptive_best_first_pair requires best_first_pair")
+    if verifier_gated_pair_growth and not adaptive_best_first_pair:
+        raise ValueError("verifier_gated_pair_growth requires adaptive_best_first_pair")
     if coupled_pair_growth and not adaptive_best_first_pair:
         raise ValueError("coupled_pair_growth requires adaptive_best_first_pair")
     if coupled_pair_growth and (K <= 2 or not second_order or shared_structure or bool(cat_groups)):
@@ -3761,6 +3890,10 @@ def reason_boost_softmax(  # noqa: C901 - multiclass boost training loop
         raise ValueError("honest_pair_growth requires adaptive_best_first_pair")
     if honest_pair_growth and coupled_pair_growth:
         raise ValueError("honest_pair_growth and coupled_pair_growth are alternative pair-tree estimators")
+    if verifier_gated_pair_growth and (coupled_pair_growth or honest_pair_growth):
+        raise ValueError(
+            "verifier_gated_pair_growth currently requires independent non-honest pair trees"
+        )
     if track_residual_dynamics and K <= 2:
         raise ValueError("residual-dynamics tracing currently requires a multiclass target")
     use_shared_structure = bool(
@@ -3795,14 +3928,16 @@ def reason_boost_softmax(  # noqa: C901 - multiclass boost training loop
             track_validation_metrics,
             allowed,
             groups,
+            independent_calibration,
         )
-    fit, ver = _fit_verifier_split(
+    fit, ver, calibration = _fit_checkpoint_calibration_split(
         yi,
         holdout,
         seed,
         stratified=stratified_holdout,
         min_verifier_events=min_verifier_events,
         validation_groups=groups,
+        independent_calibration=independent_calibration and not refit,
     )
     Xf, yf, Xv, yv = X[fit], yi[fit], X[ver], yi[ver]
     if stratified_holdout and groups is None:
@@ -3855,20 +3990,18 @@ def reason_boost_softmax(  # noqa: C901 - multiclass boost training loop
     if fit_source_weight is not None:
         wf = wf * fit_source_weight
 
-    def ll(F, yidx, weights=None):
-        p = np.clip(_softmax(F), 1e-9, 1)
-        loss = -np.log(p[np.arange(len(yidx)), yidx])
-        return float(loss.mean() if weights is None else np.average(loss, weights=weights))
-
     metrics = tuple(dict.fromkeys((validation_metric, *track_validation_metrics)))
     supported_metrics = {"logloss", "auc", "macro_ovo_auc"}
     if any(metric not in supported_metrics for metric in metrics):
         raise ValueError(f"unsupported multiclass validation metric: {metrics}")
 
-    def validation_score(metric):
+    def validation_score_for(scores, metric):
         if metric == "logloss":
-            return -ll(Fv, yv, ver_source_weight)
-        return _multiclass_ovo_auc(Fv, yv, ver_source_weight)
+            return _multiclass_log_score(scores, yv, ver_source_weight)
+        return _multiclass_ovo_auc(scores, yv, ver_source_weight)
+
+    def validation_score(metric):
+        return validation_score_for(Fv, metric)
 
     best_scores = {metric: validation_score(metric) for metric in metrics}
     keeps = dict.fromkeys(metrics, 0)
@@ -3887,6 +4020,10 @@ def reason_boost_softmax(  # noqa: C901 - multiclass boost training loop
     )
     adaptive_pair: tuple[int, int] | tuple[()] = ()
     growth_schedule: list[tuple[int, int] | tuple[()]] = []
+    attempted_growth_schedule: list[tuple[int, int] | tuple[()]] = []
+    pair_expert_decisions: list[dict] = []
+    pair_expert_states: dict[tuple[int, int], dict] = {}
+    pair_expert_auditions = 0
     dynamics_monitoring = dynamics_tracker is not None
     dynamics_monitored_rounds = 0
     adaptive_pair_activated = False
@@ -3905,7 +4042,7 @@ def reason_boost_softmax(  # noqa: C901 - multiclass boost training loop
                 bad_rounds[metric] += 1
         return all(bad_rounds[metric] >= patience for metric in metrics), round_scores
 
-    def complete_round(round_update, growth_pair):
+    def complete_round(round_update, growth_pair, attempted_pair=None):
         nonlocal adaptive_pair, adaptive_pair_activated, dynamics_monitored_rounds, dynamics_monitoring
         stopped, round_scores = checkpoint_round()
         if dynamics_tracker is not None:
@@ -3930,6 +4067,7 @@ def reason_boost_softmax(  # noqa: C901 - multiclass boost training loop
             else:
                 adaptive_pair = ()
             growth_schedule.append(tuple(growth_pair) if growth_pair else ())
+            attempted_growth_schedule.append(tuple(attempted_pair) if attempted_pair else ())
         return stopped
 
     # The generic K per-class trees in a round are independent, so large deploy
@@ -3964,6 +4102,26 @@ def reason_boost_softmax(  # noqa: C901 - multiclass boost training loop
             hard_pair = proposed_pair
             if adaptive_best_first_pair and not adaptive_pair:
                 hard_pair = ()
+            attempted_pair = hard_pair
+            pair_key = tuple(int(k) for k in hard_pair) if hard_pair else ()
+            pair_gate_state = None
+            pair_gate_phase = None
+            if verifier_gated_pair_growth and pair_key:
+                pair_gate_state = pair_expert_states.get(pair_key)
+                if pair_gate_state is None:
+                    pair_gate_state = {
+                        "phase": (
+                            "approved"
+                            if pair_expert_auditions >= _PAIR_EXPERT_MAX_TOTAL_AUDITIONS
+                            else "audition"
+                        ),
+                        "attempts": 0,
+                        "proper_score_credit": 0.0,
+                        "rank_score_credit": 0.0,
+                        "rank_observed": False,
+                    }
+                    pair_expert_states[pair_key] = pair_gate_state
+                pair_gate_phase = pair_gate_state["phase"]
             round_update_v = np.zeros_like(Fv) if dynamics_tracker is not None else None
             s = rm.random(len(fit)) < sub
             honest_structure, honest_estimation = s, None
@@ -4009,7 +4167,7 @@ def reason_boost_softmax(  # noqa: C901 - multiclass boost training loop
                         round_update_v[:, k] = verifier_update
                     trees.append((k, tree))
                     flats.append(flat)
-                if complete_round(round_update_v, hard_pair):
+                if complete_round(round_update_v, hard_pair, attempted_pair):
                     break
                 continue
 
@@ -4067,8 +4225,13 @@ def reason_boost_softmax(  # noqa: C901 - multiclass boost training loop
                 hard_pair=hard_pair,
                 honest_structure=honest_structure,
                 honest_estimation=honest_estimation,
+                pair_capacity=None,
             ):  # pure per-class work over an immutable snapshot of the round
-                pair_member = hard_pair is not None and k in hard_pair
+                pair_member = (
+                    hard_pair is not None and k in hard_pair
+                    if pair_capacity is None
+                    else bool(pair_capacity)
+                )
                 gk = wf * (pf[:, k] - Yf[:, k])
                 hk = wf * pf[:, k] * (1 - pf[:, k])  # class-weighted grad/hess
                 if second_order:  # Hessian-weighted binned splits per class
@@ -4118,8 +4281,122 @@ def reason_boost_softmax(  # noqa: C901 - multiclass boost training loop
                 flat = _flatten_tree(t)
                 return k, t, flat, None, None, _tree_pred(flat, Xf), _tree_pred(flat, Xv)
 
-            round_results = _map_k(_grow, tree_parallel_hist, independent_classes)
+            def _grow_primary(k, pair_gate_phase=pair_gate_phase, pair_key=pair_key):
+                if pair_gate_phase == "rejected" and k in pair_key:
+                    return _grow(k, pair_capacity=False)
+                return _grow(k)
+
+            round_results = _map_k(_grow_primary, tree_parallel_hist, independent_classes)
             round_results.extend(coupled_results)
+            selected_growth_pair = hard_pair
+            if pair_gate_phase == "audition":
+                ordinary_pair_results = _map_k(
+                    lambda k: _grow(k, pair_capacity=False),
+                    tree_parallel_hist,
+                    pair_key,
+                )
+                ordinary_by_class = {result[0]: result for result in ordinary_pair_results}
+                baseline_results = [
+                    ordinary_by_class.get(result[0], result) for result in round_results
+                ]
+
+                def verifier_update(results):
+                    update = np.zeros_like(Fv)
+                    for result in results:
+                        update[:, result[0]] = lr * result[6]
+                    return update
+
+                baseline_update = verifier_update(baseline_results)
+                expert_update = verifier_update(round_results)
+                local_selected, decision = _select_multiclass_pair_expert(
+                    Fv + baseline_update,
+                    Fv + expert_update,
+                    yv,
+                    ver_source_weight,
+                )
+                proper_score_delta = float(decision.get("proper_score_delta", 0.0))
+                rank_score_delta = decision.get("rank_score_delta")
+                prospective_proper_credit = (
+                    float(pair_gate_state["proper_score_credit"]) + proper_score_delta
+                )
+                prospective_rank_credit = float(pair_gate_state["rank_score_credit"])
+                if rank_score_delta is not None:
+                    prospective_rank_credit += float(rank_score_delta)
+                pair_gate_state["attempts"] += 1
+                pair_expert_auditions += 1
+                pair_gate_state["proper_score_credit"] = prospective_proper_credit
+                if rank_score_delta is not None:
+                    pair_gate_state["rank_observed"] = True
+                    pair_gate_state["rank_score_credit"] = prospective_rank_credit
+                if pair_gate_state["attempts"] >= _PAIR_EXPERT_AUDITION_ROUNDS:
+                    proper_score_harmed = (
+                        pair_gate_state["proper_score_credit"]
+                        < -_PAIR_EXPERT_SCORE_TOLERANCE
+                    )
+                    rank_score_harmed = (
+                        pair_gate_state["rank_observed"]
+                        and pair_gate_state["rank_score_credit"]
+                        < -_PAIR_EXPERT_RANK_TOLERANCE
+                    )
+                    pair_gate_state["phase"] = (
+                        "rejected"
+                        if proper_score_harmed
+                        and (rank_score_harmed or not pair_gate_state["rank_observed"])
+                        else "approved"
+                    )
+                local_reason = decision.get("reason")
+                decision.update(
+                    round=int(round_idx),
+                    pair=pair_key,
+                    selected=True,
+                    local_selected=bool(local_selected),
+                    local_reason=local_reason,
+                    reason=(
+                        "cumulative_harm_veto"
+                        if pair_gate_state["phase"] == "rejected"
+                        else "audition_evidence"
+                    ),
+                    verifier_rows=int(len(yv)),
+                    phase="audition",
+                    next_phase=pair_gate_state["phase"],
+                    audition_attempt=int(pair_gate_state["attempts"]),
+                    cumulative_proper_score_delta=float(
+                        pair_gate_state["proper_score_credit"]
+                    ),
+                    cumulative_rank_score_delta=(
+                        float(pair_gate_state["rank_score_credit"])
+                        if pair_gate_state["rank_observed"]
+                        else None
+                    ),
+                )
+                pair_expert_decisions.append(decision)
+            elif pair_gate_phase in {"approved", "rejected"}:
+                expert_selected = pair_gate_phase == "approved"
+                pair_expert_decisions.append(
+                    {
+                        "round": int(round_idx),
+                        "pair": pair_key,
+                        "selected": expert_selected,
+                        "reason": f"audition_{pair_gate_phase}",
+                        "verifier_rows": int(len(yv)),
+                        "phase": pair_gate_phase,
+                        "next_phase": pair_gate_phase,
+                        "audition_attempt": int(pair_gate_state["attempts"]),
+                        "proper_score": "negative_log_loss",
+                        "proper_score_delta": None,
+                        "rank_score_delta": None,
+                        "cumulative_proper_score_delta": float(
+                            pair_gate_state["proper_score_credit"]
+                        ),
+                        "cumulative_rank_score_delta": (
+                            float(pair_gate_state["rank_score_credit"])
+                            if pair_gate_state["rank_observed"]
+                            else None
+                        ),
+                    }
+                )
+                if not expert_selected:
+                    selected_growth_pair = ()
             for k, t, flat, pk, drest, dfull, dv in sorted(round_results, key=lambda result: result[0]):
                 if second_order and pk is not None:
                     Ff[s, k] += lr * pk  # subsample rows free (leaf values from build)
@@ -4133,7 +4410,7 @@ def reason_boost_softmax(  # noqa: C901 - multiclass boost training loop
                     round_update_v[:, k] = verifier_update
                 trees.append((k, t))
                 flats.append(flat)
-            if complete_round(round_update_v, hard_pair):
+            if complete_round(round_update_v, selected_growth_pair, attempted_pair):
                 break
         keep = keeps[validation_metric]
         trace = None
@@ -4152,9 +4429,13 @@ def reason_boost_softmax(  # noqa: C901 - multiclass boost training loop
                 selected_rounds = keep // K
                 for record in dynamics_records:
                     record["selected"] = int(record["round"]) < selected_rounds
+                for decision in pair_expert_decisions:
+                    decision["retained"] = int(decision["round"]) < selected_rounds
                 trace.update(
                     residual_dynamics=dynamics_records,
                     pair_growth_schedule=list(growth_schedule),
+                    attempted_pair_growth_schedule=list(attempted_growth_schedule),
+                    pair_expert_decisions=[dict(decision) for decision in pair_expert_decisions],
                     dynamics_monitored_rounds=dynamics_monitored_rounds,
                     selected_rounds=selected_rounds,
                 )
@@ -4168,7 +4449,7 @@ def reason_boost_softmax(  # noqa: C901 - multiclass boost training loop
                 trees[:keep],
                 classes,
                 flats[:keep],
-                (ver if not refit else None),
+                ((calibration if independent_calibration else ver) if not refit else None),
                 linear_leaf,
             )
             return (*result, trace) if return_trace else result

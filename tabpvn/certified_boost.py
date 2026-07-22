@@ -1716,6 +1716,7 @@ class AdditiveCertifiedClassifier:
         max_leaves=None,
         best_first_pair=False,
         adaptive_best_first_pair=False,
+        verifier_gated_pair_growth=False,
         coupled_pair_growth=False,
         honest_pair_growth=False,
         validation_metric="logloss",
@@ -1725,6 +1726,7 @@ class AdditiveCertifiedClassifier:
         base_feature_count=None,
         residual_stumps=(),
         allowed=None,
+        independent_calibration=False,
     ):
         self.rounds, self.lr, self.depth, self.leaf = rounds, lr, depth, leaf
         self.holdout, self.patience, self.class_weight, self.seed = holdout, patience, class_weight, seed
@@ -1740,6 +1742,7 @@ class AdditiveCertifiedClassifier:
         self.max_leaves = None if max_leaves is None else int(max_leaves)
         self.best_first_pair = bool(best_first_pair)
         self.adaptive_best_first_pair = bool(adaptive_best_first_pair)
+        self.verifier_gated_pair_growth = bool(verifier_gated_pair_growth)
         self.coupled_pair_growth = bool(coupled_pair_growth)
         self.honest_pair_growth = bool(honest_pair_growth)
         self.validation_metric = str(validation_metric)
@@ -1749,6 +1752,7 @@ class AdditiveCertifiedClassifier:
         self.base_feature_count = None if base_feature_count is None else int(base_feature_count)
         self.residual_stumps = tuple(residual_stumps)
         self.allowed = None if allowed is None else tuple(int(feature) for feature in allowed)
+        self.independent_calibration = bool(independent_calibration)
 
     def fit(self, X, y, sample_weight=None, validation_groups=None):
         # OUR OWN multinomial boosting (trees.py reason_boost_softmax) — no external model.
@@ -1844,6 +1848,7 @@ class AdditiveCertifiedClassifier:
             max_leaves=self.max_leaves,
             best_first_pair=self.best_first_pair,
             adaptive_best_first_pair=self.adaptive_best_first_pair,
+            verifier_gated_pair_growth=self.verifier_gated_pair_growth,
             coupled_pair_growth=self.coupled_pair_growth,
             honest_pair_growth=self.honest_pair_growth,
             validation_metric=self.validation_metric,
@@ -1852,6 +1857,7 @@ class AdditiveCertifiedClassifier:
             feature_count=self.base_feature_count,
             allowed=self.allowed,
             validation_groups=groups_fit,
+            independent_calibration=self.independent_calibration,
         )
         base, lr, trees, classes, flats, ver, linear = result[:7]
         training_trace = result[7] if len(result) > 7 else None
@@ -1876,7 +1882,19 @@ class AdditiveCertifiedClassifier:
             )[:selected_dynamics_rounds]
         )
         self.attempted_pair_growth_schedule_ = (
-            () if training_trace is None else tuple(training_trace.get("pair_growth_schedule", ()))
+            ()
+            if training_trace is None
+            else tuple(
+                training_trace.get(
+                    "attempted_pair_growth_schedule",
+                    training_trace.get("pair_growth_schedule", ()),
+                )
+            )
+        )
+        self.pair_expert_decisions_ = (
+            ()
+            if training_trace is None
+            else tuple(dict(row) for row in training_trace.get("pair_expert_decisions", ()))
         )
         if self.residual_stumps:
             trees, flats = list(trees), list(flats)
@@ -1911,6 +1929,11 @@ class AdditiveCertifiedClassifier:
         self._adaptive_depth_selected = False
         self.adaptive_depth_selection_ = None
         self.ver_ = fit_rows[ver] if fit_rows is not None and ver is not None else ver
+        self.verifier_evidence_role_ = (
+            "independent_calibration"
+            if self.independent_calibration and not self.refit and ver is not None
+            else ("checkpoint_selection" if ver is not None else None)
+        )
         self.ver_weight_ = (
             _prior_preserving_subset_weight(y_fit, fit_weight, ver)
             if self.rare_event and ver is not None and groups_fit is None
