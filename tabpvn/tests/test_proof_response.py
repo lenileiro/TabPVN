@@ -7,7 +7,6 @@ import pytest
 from core.kernel_fol import FOLKernel
 from core.kernel_fol import check_proof as check_kernel_proof
 from tabpvn import (
-    CertifiedAttention,
     SignedTargetAttestation,
     TabPVN,
     TargetAttestation,
@@ -319,33 +318,3 @@ def test_tabpvn_public_proof_and_certificate_do_not_embed_artifacts():
     assert TabPVN.check_proof(certificate["proof"], artifact=attested_artifact)
     with pytest.raises(ValueError, match="structured proof response"):
         model.proof(X, 4, raw=True, attestation=attestation)
-
-
-def test_attention_uses_the_same_clean_response_and_explicit_artifact_boundary():
-    X = np.arange(40, dtype=float).reshape(20, 2)
-    classification_target = (X[:, 0] > 18).astype(int)
-    classifier = CertifiedAttention(topk=3).fit(X, classification_target)
-    classification = classifier.proof(X, 2)
-    classification_artifact = classifier.proof_artifact(X, 2)
-
-    assert classification["schema"] == PROOF_SCHEMA
-    assert classification["reasons"] == [
-        {
-            "description": "Similar historical examples support this prediction.",
-            "supports": 0,
-        }
-    ]
-    assert CertifiedAttention.check_proof(classification, artifact=classification_artifact)
-
-    regression_target = np.linspace(0.1, 3.7, len(X))
-    regressor = CertifiedAttention(topk=3).fit(X, regression_target)
-    regression = regressor.proof(X, 2)
-    regression_artifact = regressor.proof_artifact(X, 2)
-
-    assert regression["schema"] == PROOF_SCHEMA
-    assert regression["prediction"]["task"] == "regression"
-    assert CertifiedAttention.check_proof(regression, artifact=regression_artifact)
-
-    tampered = copy.deepcopy(regression_artifact)
-    tampered["machine_proof"]["prediction"]["weighted_sum"] += 1.0
-    assert not CertifiedAttention.check_proof(tampered)

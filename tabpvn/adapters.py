@@ -2,22 +2,20 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
 from typing import Any, Self
 
 import numpy as np
 from numpy.typing import NDArray
 
 from tabpvn.base import TabPVN
-from tabpvn.preprocessing import _tokenize
 
 
 class TabPVNMultiOutput:
     """MULTI-LABEL and MULTI-OUTPUT tasks — a composition of per-column certified `TabPVN` models over shared
-    input (text or tabular). `fit(data, Y)` takes a 2D `Y` (n×L): each column becomes its own single-output
+    tabular input. `fit(data, Y)` takes a 2D `Y` (n×L): each column becomes its own single-output
     TabPVN, auto-detecting classification (a multi-label TAG) or regression (a multi-output SCORE) per column.
     The prediction is a per-label vector — or, for tags, a SET (`predict_sets`) — and EVERY certificate
-    (precision bound, word-level `reason`, kernel `proof`, conformal `confidence`) is available PER LABEL. The
+    (precision bound, sufficient `reason`, kernel `proof`, conformal `confidence`) is available PER LABEL. The
     sound single-output engine is reused UNCHANGED, so a multi-label answer is proof-carrying iff each label's
     is (`certify` = min over labels). Our own composition — no new learner."""
 
@@ -190,82 +188,4 @@ class TabPVNOrdinal:
         return float(min(m.certify(X) for m in self.models_))
 
 
-class TabPVNTextPair:
-    """TEXT-PAIR tasks — TWO texts → a relation (duplicate/paraphrase detection, question matching, semantic
-    similarity). Features are the OVERLAP of the pair: Jaccard, shared-token count, overlap ratio, length gap,
-    and 'both contain <token>' binary indicators — all presence-based, so a certified `TabPVN` classifies
-    (duplicate?) or regresses (a similarity score) with an interpretable reason ("both contain {python,
-    install} and high overlap ⇒ duplicate") and a proof. Our own overlap featurizer + the certified base — no
-    embedding, no cross-encoder. `fit(a, b, y)` takes the two text columns and the label/score."""
-
-    def __init__(self, seed: int = 0, alpha: float = 0.1, max_tokens: int = 200) -> None:
-        if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens <= 0:
-            raise ValueError("max_tokens must be a positive integer")
-        self.seed, self.alpha, self.max_tokens = seed, alpha, max_tokens
-
-    def _feat(self, A: Sequence[Any], B: Sequence[Any]) -> Any:
-        import pandas as pd
-
-        if len(A) != len(B):
-            raise ValueError("text-pair inputs must contain the same number of rows")
-        n = len(A)
-        jac = np.zeros(n)
-        shared = np.zeros(n)
-        ratio = np.zeros(n)
-        gap = np.zeros(n)
-        both = np.zeros((n, len(self.vocab_)))
-        for r, (a, b) in enumerate(zip(A, B, strict=True)):
-            ta, tb = set(_tokenize(str(a))), set(_tokenize(str(b)))
-            inter, uni = ta & tb, ta | tb
-            jac[r] = len(inter) / (len(uni) + 1e-9)
-            shared[r] = len(inter)
-            ratio[r] = len(inter) / (min(len(ta), len(tb)) + 1e-9)
-            gap[r] = abs(len(ta) - len(tb))
-            for t in inter:
-                j = self.vi_.get(t, -1)
-                if j >= 0:
-                    both[r, j] = 1.0
-        df = pd.DataFrame({"jaccard": jac, "shared_count": shared, "overlap_ratio": ratio, "len_gap": gap})
-        for w, j in self.vi_.items():  # named 'both_<token>' indicators -> interpretable reasons
-            df[f"both_{w}"] = both[:, j]
-        return df
-
-    def fit(self, a: Iterable[Any], b: Iterable[Any], y: Any) -> Self:
-        from collections import Counter
-
-        A, B = list(a), list(b)
-        target = np.asarray(y)
-        if target.ndim != 1:
-            raise ValueError("text-pair y must be one-dimensional")
-        if len(A) != len(B) or len(A) != len(target):
-            raise ValueError("text-pair inputs and y must contain the same number of rows")
-        c = Counter(
-            t for u, v in zip(A, B, strict=True) for t in (set(_tokenize(str(u))) & set(_tokenize(str(v))))
-        )
-        self.vocab_ = [
-            w for w, _ in c.most_common(self.max_tokens)
-        ]  # most-shared content tokens (fit on train)
-        self.vi_ = {w: i for i, w in enumerate(self.vocab_)}
-        self.model_ = TabPVN(seed=self.seed, alpha=self.alpha).fit(self._feat(A, B), target)
-        return self
-
-    def predict(self, a: Iterable[Any], b: Iterable[Any]) -> NDArray[Any]:
-        return self.model_.predict(self._feat(list(a), list(b)))
-
-    def predict_proba(self, a: Iterable[Any], b: Iterable[Any]) -> NDArray[np.float64]:
-        return self.model_.predict_proba(self._feat(list(a), list(b)))
-
-    def confidence(self, a: Iterable[Any], b: Iterable[Any]) -> Any:
-        return self.model_.confidence(self._feat(list(a), list(b)))
-
-    def reason(self, a: Iterable[Any], b: Iterable[Any], row: int) -> Any:
-        return self.model_.reason(self._feat(list(a), list(b)), row)
-
-    def certificate(self, a: Iterable[Any], b: Iterable[Any], row: int) -> Any:
-        return self.model_.certificate(self._feat(list(a), list(b)), row)
-
-    def certify(self, a: Iterable[Any], b: Iterable[Any]) -> float:
-        return self.model_.certify(self._feat(list(a), list(b)))
-
-
-__all__ = ["TabPVNMultiOutput", "TabPVNOrdinal", "TabPVNTextPair"]
+__all__ = ["TabPVNMultiOutput", "TabPVNOrdinal"]

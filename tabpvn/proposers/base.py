@@ -294,11 +294,5 @@ def default_registry() -> CandidateRegistry:
                 "cross-fit decision permission plus an independent finite-interval rank gate",
                 "OOF-supported interval counts may change predict labels; only the preselected accuracy winner may separately challenge public ranking.",
             ),
-            ProposerSpec(
-                "sdm_attention",
-                "auxiliary_proba",
-                "projected or conformal-calibrated blend",
-                "Sparse distributed-memory text member selected by OOF gain.",
-            ),
         )
     )

@@ -49,7 +49,8 @@ def _category_model():
             "cat_cols": ["left", "right"],
             "onehot": {"left": ["off", "on"], "right": ["off", "on"]},
             "target_encoding": {},
-            "text_cols": [],
+            "byte_cols": [],
+            "compression_enabled": {},
         },
     )()
     return model
@@ -388,7 +389,6 @@ def test_rank_only_posterior_changes_probability_but_not_prediction_or_proof_pat
     model._smooth = None
     model._category_memory = None
     model._proof_path_memory = None
-    model._sdm = None
 
     baseline = model._blended_proba(X, include_posterior=False)
     probability = model.predict_proba(X)
@@ -421,7 +421,6 @@ def test_selected_posterior_changes_standard_predict_and_predict_proba():
     model._smooth = None
     model._category_memory = None
     model._proof_path_memory = None
-    model._sdm = None
 
     probability = model.predict_proba(X)
     prediction = model.predict(X)

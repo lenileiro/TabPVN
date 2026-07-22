@@ -244,7 +244,6 @@ def test_decision_only_interval_changes_predict_but_not_predict_proba_or_proof_c
     model._category_memory = None
     model._proof_path_memory = None
     model._category_posterior = None
-    model._sdm = None
     model._numeric_interval = NumericIntervalPosteriorChallenger(
         X,
         y,
@@ -298,7 +297,6 @@ def test_rank_admitted_interval_is_public_but_bypassed_by_calibrated_probability
     model._category_memory = None
     model._proof_path_memory = None
     model._category_posterior = None
-    model._sdm = None
     model._numeric_interval = NumericIntervalPosteriorChallenger(
         X,
         y,

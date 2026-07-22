@@ -286,30 +286,6 @@ def test_affine_gate_uses_fold_prior_and_is_noop_outside_temporal_evidence(monke
     assert model.affine_rank_report_[-1]["oof_prior_source"] == "fold_training_rows"
 
 
-def test_affine_schema_profile_admits_structured_dominant_mixed_tables():
-    model = TabPVN(seed=0)
-    model._prep = SimpleNamespace(
-        text_cols=["description"],
-        text_feat={"description": SimpleNamespace(vocab=tuple(range(40)))},
-    )
-
-    admitted = model._affine_schema_profile(100)
-    model._prep.text_feat["description"].vocab = tuple(range(80))
-    rejected = model._affine_schema_profile(100)
-
-    assert admitted == {
-        "eligible": True,
-        "features": 100,
-        "schema": "mixed_structured_text",
-        "structured_features": 60,
-        "token_features": 40,
-        "token_fraction": 0.4,
-    }
-    assert rejected["eligible"] is False
-    assert rejected["structured_features"] == 20
-    assert rejected["token_fraction"] == 0.8
-
-
 def test_affine_rank_only_selects_best_admitted_composition(monkeypatch):
     class AffineStub:
         combine = staticmethod(AffineLogitRead.combine)

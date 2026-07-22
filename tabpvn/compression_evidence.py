@@ -1,4 +1,4 @@
-"""Transparent class-conditional compression evidence for text columns.
+"""Transparent class-conditional compression evidence for raw byte fields.
 
 The map learns a bounded dictionary of discriminative byte phrases. Each
 phrase carries a quantized log-likelihood ratio against a class-balanced
@@ -325,7 +325,7 @@ class CompressionEvidenceMap:
         return output
 
     def feature_names(self, column: Any) -> list[str]:
-        """Return stable feature names without entering the bag-of-words namespace."""
+        """Return stable feature names for direct UTF-8 byte evidence."""
         self._require_fitted()
         prefix = str(column)
         names = [f"{prefix}__compression_bits={label}" for label in self.classes_]

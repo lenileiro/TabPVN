@@ -284,8 +284,6 @@ _AFFINE_RANK_MIN_FOLD_GAIN = 0.0
 _AFFINE_DECISION_MIN_ACCURACY_GAIN = 0.005
 _AFFINE_DECISION_MIN_PAIRED_Z = 2.0
 _AFFINE_DECISION_MAX_RANK_REGRESSION = 0.001
-_AFFINE_MIXED_MIN_STRUCTURED_FEATURES = 32
-_AFFINE_MIXED_MAX_TOKEN_FRACTION = 0.5
 _TARGET_ENCODING_MIN_RANK_GAIN = 0.003
 _TARGET_ENCODING_SUPPORT_MIN_RANK_GAIN = 0.001
 _TARGET_ENCODING_MIN_RELATIVE_LOG_LOSS_GAIN = 0.002
@@ -1444,93 +1442,6 @@ class _ProofPathMemory:
         }
 
 
-class _SDMAttention:
-    """Sparse Distributed Memory read = transformer attention over stored training patterns — OUR OWN
-    associative-memory primitive (pure numpy, no external model/embedding). Keys are the training docs'
-    IDF-weighted, L2-normalized binary token vectors; values are one-hot labels; a query's class proba =
-    softmax(beta·cosine(query, keys)) @ values. This is the attention≈SDM read (Bricken & Pehlevan): the
-    softmax activates the stored addresses nearest the query and pools their contents. CLASSIFICATION pools
-    one-hot labels (`proba`); REGRESSION pools the continuous targets — Nadaraya-Watson attention (`read`).
-    Captures 'this text resembles these training texts' — a non-parametric similarity signal that complements
-    the token-threshold booster on graded text. Operates ONLY on the bag-of-words token columns (`cols`) so it
-    is not confused by mixed-scale tabular features; the cosine + IDF weighting is what beats a raw dot-product."""
-
-    def __init__(self, X, y, classes, cols, beta=10.0, cap=4000, seed=0, regression=False):
-        self.cols = np.asarray(cols, int)
-        self.beta = float(beta)
-        self.regression = regression
-        X, y = np.asarray(X, float), np.asarray(y)
-        if len(X) > cap:  # SDM stores a sample of hard locations — bound the memory / read cost
-            idx = np.random.default_rng(seed).choice(len(X), cap, replace=False)
-            X, y = X[idx], y[idx]
-        M = X[:, self.cols]
-        self.idf = np.log((len(M) + 1) / (M.sum(0) + 1)) + 1.0  # down-weight ubiquitous tokens
-        K = M * self.idf
-        self.K = K / (np.linalg.norm(K, axis=1, keepdims=True) + 1e-9)
-        if regression:
-            self.vals = y.astype(float)  # stored continuous targets
-        else:
-            self.classes = list(classes)
-            ci = {c: i for i, c in enumerate(self.classes)}
-            self.V = np.eye(len(self.classes))[[ci[v] for v in y]]
-
-    def _weights(self, X):  # softmax(beta·cosine) attention weights, query rows × memory
-        Q = np.asarray(X, float)[:, self.cols] * self.idf
-        Q = Q / (np.linalg.norm(Q, axis=1, keepdims=True) + 1e-9)
-        return Q
-
-    def proba(self, X):  # classification: pool one-hot labels
-        Q = self._weights(X)
-        out = np.zeros((len(Q), len(self.V[0])))
-        for i in range(0, len(Q), 512):  # chunk the query×memory attention matrix
-            S = Q[i : i + 512] @ self.K.T
-            S -= S.max(1, keepdims=True)
-            W = np.exp(self.beta * S)
-            W /= W.sum(1, keepdims=True)
-            out[i : i + 512] = W @ self.V
-        return out
-
-    def read(self, X):  # regression: Nadaraya-Watson attention over stored target values
-        Q = self._weights(X)
-        out = np.zeros(len(Q))
-        for i in range(0, len(Q), 512):
-            S = Q[i : i + 512] @ self.K.T
-            S -= S.max(1, keepdims=True)
-            W = np.exp(self.beta * S)
-            W /= W.sum(1, keepdims=True)
-            out[i : i + 512] = W @ self.vals
-        return out
-
-    def refit(self, X, y):  # a fresh instance on new data (for the OOF calibration folds)
-        return _SDMAttention(X, y, None, self.cols, beta=self.beta, regression=True, seed=self.seed)
-
-
-class _LinearReg:
-    """Ridge regression over the bag-of-words token columns — OUR OWN numpy primitive (closed-form, no external
-    lib). On sparse text REGRESSION a linear model weights the many RARE informative tokens (a product's
-    model/year/trim → price) that the tree booster cannot split on — so it closes a gap the booster structurally
-    can't. Blended in as an accuracy member (booster carries the interpretable reason; the conformal interval is
-    recalibrated on the blend). `read` mirrors `_SDMAttention.read` so both are interchangeable regression
-    members."""
-
-    def __init__(self, X, y, cols, lam=1.0, seed=0):
-        self.cols = np.asarray(cols, int)
-        self.lam = float(lam)
-        self.seed = seed
-        M = np.asarray(X, float)[:, self.cols]
-        yv = np.asarray(y, float)
-        self.mu, self.ybar = M.mean(0), float(yv.mean())
-        Mc = M - self.mu
-        A = Mc.T @ Mc + self.lam * np.eye(Mc.shape[1])  # ridge normal equations (features are few-hundred–1k)
-        self.W = np.linalg.solve(A, Mc.T @ (yv - self.ybar))
-
-    def read(self, X):
-        return self.ybar + (np.asarray(X, float)[:, self.cols] - self.mu) @ self.W
-
-    def refit(self, X, y):
-        return _LinearReg(X, y, self.cols, self.lam, self.seed)
-
-
 def _booster_importance(pred, D):
     """Per-feature split frequency across the classifier's boosted trees — a cheap importance the smooth k-NN
     uses to weight its metric. `pred.trees_` = list of (class, tuple-tree). Returns sqrt-normalized weights."""
@@ -2490,7 +2401,7 @@ class TabPVN:
                 # gain, so they retain the incumbent verifier geometry.
                 prep = getattr(self, "_prep", None)
                 numeric_schema = prep is None or not (
-                    getattr(prep, "cat_cols", ()) or getattr(prep, "text_cols", ())
+                    getattr(prep, "cat_cols", ())
                 )
                 stratified_verifier = bool(
                     self._multiclass_stratified_verifier
@@ -2578,7 +2489,6 @@ class TabPVN:
         self._affine_composition = "arithmetic"
         self._affine_rank_oof_proba = None  # transient selected OOF rank surface
         self._affine_decision_oof_labels = None  # transient selected OOF top-1 decisions
-        self._sdm = None  # SDM-attention associative-memory member (set below for text classification)
         if self.additive:  # full-coverage proof-carrying ensemble
             predictor_boost = dict(boost)
             if self.mode == "classification" and predictor_boost.get("refit", True) is False:
@@ -2668,15 +2578,6 @@ class TabPVN:
                         ),
                     }
                 )
-            # REGRESSION SDM-attention member: built BEFORE the confidence layer so the conformal bound is
-            # calibrated on the BLENDED predictor (essential — the guaranteed interval must cover what
-            # predict() returns). Nadaraya-Watson attention over the token vectors; blended if it CLEARLY helps.
-            if auto_cfg and self.mode == "regression" and self._has_text():
-                kind, w = self._sdm_gate_reg(X, y)
-                if kind is not None:
-                    cols = [j for j, nm in enumerate(self.feature_names_) if "~" in str(nm)]
-                    self._sdm = self._reg_member(X, y, cols)[kind](kind)  # SDM attention or ridge linear read
-                    self._sdm_w = w
             # SHARED OOF: when the smooth gate will run (small-n classification, no LEVER-A holdout), the
             # confidence layer and the smooth gate would each fit their own deployed-config K-fold OOF. Build
             # it ONCE and let both reuse it — saves ~2 booster fits per fit, guarantee preserved (verified).
@@ -2691,9 +2592,7 @@ class TabPVN:
                 and len(y) <= _CONF_MAX_N
             ):
                 _oof = self._clf_oof(X, y)
-            self._build_confidence(
-                X, y, precomp=_oof
-            )  # certified bounds/precision (reg: on booster+SDM blend)
+            self._build_confidence(X, y, precomp=_oof)
             if (
                 auto_cfg
                 and self.mode == "classification"
@@ -2951,20 +2850,6 @@ class TabPVN:
             self._numeric_interval_oof_labels = None
             self._affine_rank_oof_proba = None
             self._affine_decision_oof_labels = None
-            # SDM-attention member: TEXT classification, blended if it CLEARLY helps out-of-fold (zero-downside).
-            # An associative-memory read over the token vectors — complements the booster on graded text.
-            if (
-                auto_cfg
-                and self.mode == "classification"
-                and not self.rare_event_
-                and self._has_text()
-                and self._affine_rank is None
-            ):
-                w = self._sdm_gate(X, y)
-                if w > 0:
-                    cols = [j for j, nm in enumerate(self.feature_names_) if "~" in str(nm)]
-                    self._sdm = _SDMAttention(X, y, self._pred.classes_, cols, seed=self.seed)
-                    self._sdm_w = w
         else:
             raise RuntimeError("non-additive research predictors are not part of the production runtime")
         return self
@@ -3490,33 +3375,6 @@ class TabPVN:
                 probability = selected
         return probability
 
-    def _affine_schema_profile(self, n_features):
-        """Describe whether a text-bearing table still has enough structured signal."""
-        n_features = int(n_features)
-        has_text = self._has_text()
-        token_features: int = 0
-        if has_text and self._prep is not None:
-            prep = self._prep
-            try:
-                token_features = int(sum(len(prep.text_feat[column].vocab) for column in prep.text_cols))
-            except (AttributeError, KeyError, TypeError):
-                token_features = sum(1 for name in (self.feature_names_ or ()) if "~" in str(name))
-        structured_features = max(n_features - token_features, 0)
-        token_fraction = token_features / max(n_features, 1)
-        eligible = not has_text or (
-            token_features > 0
-            and structured_features >= _AFFINE_MIXED_MIN_STRUCTURED_FEATURES
-            and token_fraction <= _AFFINE_MIXED_MAX_TOKEN_FRACTION
-        )
-        return {
-            "eligible": bool(eligible),
-            "features": n_features,
-            "schema": "mixed_structured_text" if has_text else "structured",
-            "structured_features": int(structured_features),
-            "token_features": int(token_features),
-            "token_fraction": float(token_fraction),
-        }
-
     def _global_affine_rank_gate(self, X, y, precomp):
         """Admit affine logits for rank, and separately gate top-1 authority."""
         classes = np.asarray(self._pred.classes_)
@@ -3543,14 +3401,10 @@ class TabPVN:
                 rows=int(len(labels)),
             )
             return 0.0
-        schema = self._affine_schema_profile(X.shape[1])
-        if X.shape[1] > _AFFINE_RANK_MAX_FEATURES or not schema["eligible"]:
+        schema = {"features": int(X.shape[1]), "schema": "tabular"}
+        if X.shape[1] > _AFFINE_RANK_MAX_FEATURES:
             self.affine_rank_report_[0].update(
-                reason=(
-                    "outside_compact_feature_regime"
-                    if X.shape[1] > _AFFINE_RANK_MAX_FEATURES
-                    else "text_dominates_mixed_schema"
-                ),
+                reason="outside_compact_feature_regime",
                 **schema,
             )
             return 0.0
@@ -3796,7 +3650,7 @@ class TabPVN:
         self._proof_path_memory_mode = "local_vote"
         self._proof_path_memory_router = None
         self.proof_path_memory_report_ = [{"name": "proof_path_memory", "selected": False}]
-        if precomp is None or self._has_text() or len(X) < 200 or len(X) > _PROOF_PATH_MEMORY_MAX_N:
+        if precomp is None or len(X) < 200 or len(X) > _PROOF_PATH_MEMORY_MAX_N:
             return 0.0
         classes = np.asarray(self._pred.classes_)
         ci = {value: idx for idx, value in enumerate(classes)}
@@ -4248,7 +4102,6 @@ class TabPVN:
         self.category_memory_report_ = [{"name": "categorical_evidence", "selected": False}]
         if (
             precomp is None
-            or self._has_text()
             or len(groups) < 4
             or len(X) < 200
             or len(X) > _CATEGORY_MEMORY_MAX_N
@@ -4465,7 +4318,7 @@ class TabPVN:
         if precomp is None:
             self.category_posterior_report_[0]["reason"] = "shared_oof_unavailable"
             return 0.0
-        if self._has_text() or len(groups) < 2 or len(X) < 200:
+        if len(groups) < 2 or len(X) < 200:
             self.category_posterior_report_[0]["reason"] = "ineligible_schema_or_evidence"
             return 0.0
         if len(X) > _CATEGORY_POSTERIOR_MAX_N:
@@ -4759,7 +4612,7 @@ class TabPVN:
         if precomp is None:
             self.numeric_interval_report_[0]["reason"] = "shared_oof_unavailable"
             return 0.0
-        if self._has_text() or len(columns) < 2 or len(X) < 200:
+        if len(columns) < 2 or len(X) < 200:
             self.numeric_interval_report_[0]["reason"] = "ineligible_schema_or_evidence"
             return 0.0
         if len(X) > _NUMERIC_INTERVAL_MAX_N:
@@ -5042,174 +4895,6 @@ class TabPVN:
                 rare_class=(self.rare_class_ if self.rare_event_ else None),
                 validation_groups=(None if self._fit_validation is None else self._validation_groups(rows)),
             )
-
-    def _sdm_gate(self, X, y):
-        """Leak-safe SELECTION+weight gate for the SDM-attention member (text classification): 3-fold OOF of
-        the booster vs a booster+attention blend at candidate weights; return the weight that CLEARLY beats the
-        booster out-of-fold, else 0 (so keyword-decisive text keeps the pure booster — zero-downside). Rows
-        subsampled for gate cost; booster at the deployed config for a fair comparison."""
-        cols = [j for j, nm in enumerate(self.feature_names_ or []) if "~" in str(nm)]
-        if not cols:
-            return 0.0
-        classes = np.asarray(self._pred.classes_)
-        ci = {c: i for i, c in enumerate(classes)}
-        yi = np.array([ci[v] for v in y])
-        Xg, yg, yig = X, np.asarray(y), yi
-        groups = self._validation_groups()
-        if len(yi) > 2500:  # a coarse accuracy statistic doesn't need every row
-            selected, _weight = self._bounded_evidence_rows(
-                y,
-                2500,
-                self.seed + 3,
-                stratified=False,
-            )
-            sub = np.arange(len(yi)) if selected is None else selected
-            Xg, yg, yig = X[sub], np.asarray(y)[sub], yi[sub]
-            groups = None if groups is None else groups[sub]
-        kw = {
-            k: v
-            for k, v in dict(self._cfg).items()
-            if k
-            in {
-                "rounds",
-                "lr",
-                "depth",
-                "leaf",
-                "holdout",
-                "patience",
-                "linear_leaf",
-                "class_weight",
-                "rare_event",
-                "rare_min_events",
-                "min_verifier_events",
-                "validation_metric",
-                "base_feature_count",
-                "residual_stumps",
-                "max_leaves",
-                "best_first_pair",
-                "adaptive_best_first_pair",
-                "verifier_gated_pair_growth",
-                "coupled_pair_growth",
-                "honest_pair_growth",
-                "allowed",
-            }
-            and v is not None
-        }
-        kw["refit"] = False
-        oob = np.zeros((len(yig), len(classes)))
-        oos = np.zeros((len(yig), len(classes)))
-        try:
-            splits = self._validation_splits(
-                yig,
-                folds=3,
-                classification=True,
-                groups=groups,
-            )
-            for tri, vai in splits:
-                m = self._fit_certified(
-                    self._classifier(**kw),
-                    Xg[tri],
-                    yg[tri],
-                    groups=(None if groups is None else groups[tri]),
-                )
-                F = m._scores(Xg[vai])
-                e = np.exp(F - F.max(1, keepdims=True))
-                pb = e / e.sum(1, keepdims=True)
-                for j, c in enumerate(m.classes_):
-                    oob[vai, ci[c]] = pb[:, j]
-                oos[vai] = _SDMAttention(Xg[tri], yg[tri], classes, cols, seed=self.seed).proba(Xg[vai])
-        except Exception:
-            return 0.0  # if the OOF can't be built, keep the pure booster
-        evidence_rows = np.unique(np.concatenate([valid for _train, valid in splits]))
-        acc_b = (oob[evidence_rows].argmax(1) == yig[evidence_rows]).mean()
-        best_w, best_acc = 0.0, acc_b
-        for w in (0.3, 0.5, 0.7):  # pick the blend weight that helps most out-of-fold
-            acc = (
-                ((1 - w) * oob[evidence_rows] + w * oos[evidence_rows]).argmax(1) == yig[evidence_rows]
-            ).mean()
-            if acc > best_acc + 1e-9:
-                best_acc, best_w = acc, w
-        # require a CLEAR OOF gain (≥0.01): marginal gains don't transfer to the test set and can regress a
-        # near-ceiling booster (e.g. spam), so keep the pure booster unless the memory member clearly wins.
-        return best_w if best_acc > acc_b + 0.01 else 0.0
-
-    def _reg_member(self, X, y, cols):  # build a fresh regression aux member of the given kind
-        return {
-            "sdm": lambda k: _SDMAttention(X, y, None, cols, beta=20.0, regression=True, seed=self.seed),
-            "linear": lambda k: _LinearReg(X, y, cols, seed=self.seed),
-        }
-
-    def _sdm_gate_reg(self, X, y):
-        """Leak-safe gate for the REGRESSION aux member: 3-fold OOF R² of the booster vs a booster+member blend,
-        for BOTH candidate members — SDM Nadaraya-Watson attention AND a ridge linear read (the linear model is
-        what closes the big gap on rare-token regression like car→price, which the tree booster structurally
-        can't). Returns (kind, weight) with a CLEAR OOF R² gain, else (None, 0) — zero-downside."""
-        from sklearn.metrics import r2_score
-
-        cols = [j for j, nm in enumerate(self.feature_names_ or []) if "~" in str(nm)]
-        if not cols:
-            return None, 0.0
-        yv = np.asarray(y, float)
-        Xg, yg = X, yv
-        groups = self._validation_groups()
-        if len(yv) > 2500:
-            selected, _weight = self._bounded_evidence_rows(
-                yv,
-                2500,
-                self.seed + 3,
-                stratified=False,
-            )
-            sub = np.arange(len(yv)) if selected is None else selected
-            Xg, yg = X[sub], yv[sub]
-            groups = None if groups is None else groups[sub]
-        accept = {
-            "rounds",
-            "lr",
-            "depth",
-            "leaf",
-            "subsample",
-            "colsample",
-            "lam",
-            "nbins",
-            "huber",
-            "holdout",
-            "patience",
-        }
-        kw = {k: v for k, v in dict(self._cfg).items() if k in accept and v is not None}
-        kw["refit"] = False
-        ob = np.empty(len(yg))
-        cand = {"sdm": np.empty(len(yg)), "linear": np.empty(len(yg))}
-        try:
-            splits = self._validation_splits(
-                yg,
-                folds=3,
-                classification=False,
-                groups=groups,
-            )
-            for trn, val in splits:
-                ob[val] = self._fit_certified(
-                    AdditiveCertifiedRegressor(seed=self.seed, **kw),
-                    Xg[trn],
-                    yg[trn],
-                    groups=(None if groups is None else groups[trn]),
-                ).predict(Xg[val])
-                mk = self._reg_member(Xg[trn], yg[trn], cols)
-                for kind in cand:
-                    cand[kind][val] = mk[kind](kind).read(Xg[val])
-        except Exception:
-            return None, 0.0
-        evidence_rows = np.unique(np.concatenate([valid for _train, valid in splits]))
-        r_b = r2_score(yg[evidence_rows], ob[evidence_rows])
-        best = (None, 0.0, r_b)
-        for kind, candidate_output in cand.items():
-            for w in (0.3, 0.5, 0.7):
-                r = r2_score(
-                    yg[evidence_rows],
-                    (1 - w) * ob[evidence_rows] + w * candidate_output[evidence_rows],
-                )
-                if r > best[2]:
-                    best = (kind, w, r)
-        return (best[0], best[1]) if best[2] > r_b + 0.005 else (None, 0.0)  # clear OOF R² gain
 
     def _clf_oof(self, X, y, folds=3):
         """One StratifiedKFold OOF of the DEPLOYED-config classifier, SHARED by the confidence layer and the
@@ -5544,13 +5229,6 @@ class TabPVN:
                         ),
                     )
                     pred = mdl.predict(X[val])
-                    # if a regression SDM member is deployed, calibrate on the BLENDED OOF prediction so the
-                    # conformal bound covers what predict() actually returns (soundness under blending).
-                    if self.mode == "regression" and getattr(self, "_sdm", None) is not None:
-                        sf = self._sdm.refit(X[trn], y[trn]).read(
-                            X[val]
-                        )  # SDM or linear member, same interface
-                        pred = (1.0 - self._sdm_w) * pred + self._sdm_w * sf
                     sc = mdl._scores(X[val]) if self.mode == "classification" else None
                     return val, pred, sc
 
@@ -8585,10 +8263,6 @@ class TabPVN:
         exact either way — affine leaves generalize the constant interval / provably-constant `stability` to a
         provably-within-±ε band — but that is a real semantics change, so the gate demands a genuine gain, not
         neutrality. Returns True/False. Fully automatic (part of the self-configuration pipeline; no knob)."""
-        # All-text (sparse bag-of-words) input: linear leaves are ridge models over the leaf's PATH features,
-        # of which sparse text has ~none, so they never help (verified) — skip the costly gate fits entirely.
-        if getattr(self, "_prep", None) is not None and self._prep.text_cols and not self._prep.num_cols:
-            return False
         X = np.asarray(X, float)
         y = np.asarray(y, float)
         n = len(y)
@@ -8633,9 +8307,6 @@ class TabPVN:
         refit off for speed. Zero-downside by construction; stays off where linear leaves don't genuinely help."""
         from sklearn.metrics import log_loss
 
-        # All-text (sparse bag-of-words): linear leaves are path-constrained -> never help (verified); skip.
-        if getattr(self, "_prep", None) is not None and self._prep.text_cols and not self._prep.num_cols:
-            return False
         if len(y) < 400:
             return False
         Xg, yg = X, np.asarray(y)
@@ -8798,12 +8469,6 @@ class TabPVN:
                 if self.monotone_
                 else ""
             )
-            sdm = (
-                f"; blended with an SDM-attention memory (weight {self._sdm_w:.2f}) — an associative read over "
-                "the token vectors that lifts accuracy on graded text (the booster still carries the proof)"
-                if getattr(self, "_sdm", None) is not None
-                else ""
-            )
             posterior = (
                 f"; categorical Dirichlet posterior challenger (weight {self._category_posterior_w:.2f}, "
                 f"{self._category_posterior_smoothing} smoothing, "
@@ -8837,7 +8502,6 @@ class TabPVN:
                 f"prediction = base + Σ (kernel-verified region contributions) — proof via .proof(X,row)"
                 + cfg
                 + mono
-                + sdm
                 + posterior
                 + interval
                 + no_signal
@@ -9070,13 +8734,8 @@ class TabPVN:
                 return preds  # abstentions present -> object array with None
             return np.asarray([p for p in preds])  # nothing abstained -> clean native dtype (unchanged)
         X = self._X(X)
-        sdm = getattr(self, "_sdm", None)
         if self.mode == "regression":
             pred = self._pred.predict(X)
-            if (
-                sdm is not None
-            ):  # blend the Nadaraya-Watson attention read (conformal bound calibrated on this)
-                pred = (1.0 - self._sdm_w) * pred + self._sdm_w * sdm.read(X)
         elif any(
             member is not None
             for member in (
@@ -9086,7 +8745,6 @@ class TabPVN:
                 getattr(self, "_category_posterior", None),
                 getattr(self, "_numeric_interval", None),
                 getattr(self, "_affine_rank", None),
-                sdm,
             )
         ):
             pred = self._classification_prediction(X)
@@ -9122,7 +8780,6 @@ class TabPVN:
                 getattr(self, "_category_posterior", None),
                 getattr(self, "_numeric_interval", None),
                 getattr(self, "_affine_rank", None),
-                getattr(self, "_sdm", None),
             )
         )
         report["public_predict_eligible"] = not downstream_members
@@ -9265,9 +8922,8 @@ class TabPVN:
         include_interval_rank=True,
         include_affine_rank=True,
     ):
-        """Calibrated booster probabilities, blended with the gated proposer members if present: the smooth
-        k-NN (small n), proof-path evidence, and the SDM-attention associative memory (text). Each is a convex
-        blend applied only when its OOF gate kept it, then projected to retain the certified booster class. A
+        """Calibrated booster probabilities, blended with gated proposer members when present. Each convex
+        blend is applied only when its OOF gate kept it, then projected to retain the certified booster class. A
         selected categorical posterior runs last: a ``rank_only`` update is projected into the certified class,
         while a ``class_change`` update may override it because paired cross-fitted evidence earned that
         authority. A decision-admitted numeric interval posterior may refine the public surface only after an
@@ -9315,8 +8971,6 @@ class TabPVN:
             )
             router = getattr(self, "_proof_path_memory_router", None)
             p = candidate if router is None else router.apply(p, expert, candidate)
-        if getattr(self, "_sdm", None) is not None:  # SDM-attention read over the token vectors (graded text)
-            p = (1.0 - self._sdm_w) * p + self._sdm_w * self._sdm.proba(X)
         p = _preserve_certified_class(certified, p)
         posterior = getattr(self, "_category_posterior", None)
         if include_posterior and posterior is not None:
@@ -9673,31 +9327,7 @@ class TabPVN:
 
         booster_proof = self._pred.proof(X, row)
         base_prediction = float(self._pred.predict(X[row : row + 1])[0])
-        member = getattr(self, "_sdm", None)
-        if member is None:
-            return booster_proof, base_prediction, False
-        member_prediction = float(member.read(X[row : row + 1])[0])
-        member_weight = float(self._sdm_w)
-        prediction = (1.0 - member_weight) * base_prediction + member_weight * member_prediction
-        return (
-            {
-                "kind": "regression_blend",
-                "prediction": prediction,
-                "base": {
-                    "kind": "certified_additive_booster",
-                    "weight": 1.0 - member_weight,
-                    "prediction": base_prediction,
-                },
-                "member": {
-                    "kind": "associative_memory",
-                    "weight": member_weight,
-                    "prediction": member_prediction,
-                },
-                "base_proof": booster_proof,
-            },
-            prediction,
-            False,
-        )
+        return booster_proof, base_prediction, False
 
     def _proof_artifact_encoded(self, X, row, attestation=None, trusted_attestation_keys=None):
         row = self._proof_row(row, len(X))
@@ -9806,7 +9436,6 @@ class TabPVN:
             for j in sorted(box):
                 parts.append(numstr(colname(j), box[j]["lo"], box[j]["hi"]))
         else:
-            tcount = {}  # text: col -> #tokens held fixed over the box (collapsed; a per-token list is unreadable)
             for g in meta:
                 present = [j for j in g["cols"] if j in box]
                 if not present:
@@ -9818,8 +9447,10 @@ class TabPVN:
                     parts.append(f"{g['label']} = {active[0]} (fixed)" if active else f"{g['label']} (fixed)")
                 elif g["kind"] == "isna":
                     parts.append(f"{g['label']} is {'missing' if x[present[0]] > 0.5 else 'present'} (fixed)")
-                elif g["kind"] == "text":
-                    tcount[g["label"]] = tcount.get(g["label"], 0) + 1
+                elif g["kind"] == "byte_evidence":
+                    labels = dict(zip(g["cols"], g["feature_names"], strict=True))
+                    bounds = [numstr(labels[j], box[j]["lo"], box[j]["hi"]) for j in present]
+                    parts.append(f"{g['label']} byte evidence: {', '.join(bounds)}")
                 elif g["kind"] == "encoded_category":
                     parts.append(f"{g['label']} category is fixed")
                 elif g["kind"] == "num":
@@ -9840,8 +9471,6 @@ class TabPVN:
                 else:
                     j = present[0]
                     parts.append(numstr(g["label"], box[j]["lo"], box[j]["hi"]))
-            for lab, k in tcount.items():
-                parts.append(f"{lab}: {k} token(s) fixed")
         res["stable_region"] = parts
         res["n_features_constant_over"] = len(parts)
         return res
@@ -10054,13 +9683,22 @@ class TabPVN:
                     }
                 )
                 idx += width
-        for (
-            c
-        ) in p.text_cols:  # bag-of-words token columns, LAST (matches transform/names). One group per token;
-            for t in p.text_feat[c].vocab:  # binary presence -> not widened (like one-hot dummies)
-                col_groups.append([idx])
-                meta.append({"label": str(c), "kind": "text", "token": t, "cols": [idx]})
-                idx += 1
+        for c in getattr(p, "byte_cols", []):
+            if not p.compression_enabled.get(c, False):
+                continue
+            feature_names = p.compression_maps[c].feature_names(c)
+            cols = list(range(idx, idx + len(feature_names)))
+            col_groups.append(cols)
+            meta.append(
+                {
+                    "label": str(c),
+                    "source": c,
+                    "kind": "byte_evidence",
+                    "cols": cols,
+                    "feature_names": feature_names,
+                }
+            )
+            idx += len(cols)
         for name in getattr(self, "interaction_features_", []):
             col_groups.append([idx])
             # Derived facts are recomputed from the raw schema. They can explain
@@ -10097,10 +9735,6 @@ class TabPVN:
             n_used = len(parts)
             total = len(x)
         else:
-            tpos, tneg = (
-                {},
-                {},
-            )  # text: col -> [tokens] the reason requires PRESENT / ABSENT (aggregated below)
             for g in meta:
                 present = [j for j in g["cols"] if j in cond]
                 if not present:
@@ -10121,11 +9755,13 @@ class TabPVN:
                     j = present[0]
                     missing = cond[j].get("lo") is not None  # isna flag forced =1
                     parts.append(f"{g['label']} is {'missing' if missing else 'present'}")
-                elif g["kind"] == "text":  # lo set => token forced PRESENT, else ABSENT — collect per column
-                    j = present[0]
-                    (tpos if cond[j].get("lo") is not None else tneg).setdefault(g["label"], []).append(
-                        g["token"]
-                    )
+                elif g["kind"] == "byte_evidence":
+                    labels = dict(zip(g["cols"], g["feature_names"], strict=True))
+                    bounds = []
+                    for j in present:
+                        rendered = box_str(labels[j], cond[j].get("lo"), cond[j].get("hi"))
+                        bounds.append(rendered if rendered else f"{labels[j]} = {x[j]:g}")
+                    parts.append(f"{g['label']} byte evidence: {', '.join(bounds)}")
                 elif g["kind"] == "derived":
                     j = present[0]
                     required = cond[j].get("lo") is not None
@@ -10177,18 +9813,6 @@ class TabPVN:
                     lab = g["label"] + (" (frequency)" if g["kind"] == "freq" else "")
                     s = box_str(lab, cond[j].get("lo"), cond[j].get("hi"))
                     parts.append(s if s else f"{g['label']} = {x[j]:g}")
-            # emit text conditions readably: the PRESENT words (the signal) in full; the many ABSENT ones that
-            # abduction needs to exclude other classes are collapsed to a count so the rule stays legible.
-            for lab in list(tpos) + [c for c in tneg if c not in tpos]:
-                if tpos.get(lab):
-                    parts.append(f"{lab} contains {{{', '.join(sorted(tpos[lab]))}}}")
-                neg = tneg.get(lab, [])
-                if neg:
-                    parts.append(
-                        f"{lab} excludes {{{', '.join(sorted(neg))}}}"
-                        if len(neg) <= 6
-                        else f"{lab} excludes {len(neg)} other keywords"
-                    )
             n_used = len(parts)
             total = len(self._prep.input_cols) if self._prep is not None else self.n_input_features_
 
@@ -10226,79 +9850,12 @@ class TabPVN:
         r = self.reason(X, row)
         return r["rule"] + ("\n" + r["explanation"] if with_explanation else "")
 
-    def _has_text(self):
-        return self._prep is not None and bool(getattr(self._prep, "text_cols", []))
-
-    def _text_robustness(self, Xenc, row, max_flips=8):
-        """Robustness for TEXT features, where the continuous IQR radius is meaningless (a binary token has a
-        degenerate IQR). The right notion is a Hamming radius over WORDS: (a) EXACT — check every single-word
-        add/remove; if none flips the class, the prediction is certified stable to any one-word change; and
-        (b) an achievable upper bound — greedily flip the word that most erodes the class margin until the
-        class changes (kernel-verified), reporting how many word changes it took and which. Only the token
-        (bag-of-words) columns are perturbed; all other features stay fixed."""
-        _, meta, _ = self._reason_groups()
-        tcols = [(g["cols"][0], g["label"], g["token"]) for g in (meta or []) if g["kind"] == "text"]
-        cols = [c for c, _, _ in tcols]
-        x = np.asarray(Xenc[row], float)
-
-        def argcol(V):  # winning score-column index per row
-            return self._pred._scores(V).argmax(1)
-
-        c0 = int(argcol(x[None, :])[0])
-        # (a) exact single-word-change neighborhood
-        V = np.tile(x, (len(cols), 1))
-        for r, j in enumerate(cols):
-            V[r, j] = 0.0 if x[j] > 0.5 else 1.0
-        one = argcol(V) if len(cols) else np.array([], int)
-        breakers = [tcols[r] for r in range(len(cols)) if int(one[r]) != c0]
-        # (b) greedy minimal multi-word flip
-        cur, flips, remaining, changed = x.copy(), [], list(range(len(cols))), False
-        for _ in range(max_flips):
-            if not remaining:
-                break
-            C = np.tile(cur, (len(remaining), 1))
-            for r, ti in enumerate(remaining):
-                j = cols[ti]
-                C[r, j] = 0.0 if cur[j] > 0.5 else 1.0
-            F = self._pred._scores(C)
-            win = F.argmax(1)
-            hit = [r for r in range(len(remaining)) if int(win[r]) != c0]
-            if hit:  # this single extra flip already changes the class -> minimal reached
-                ti = remaining[hit[0]]
-                cur[cols[ti]] = 0.0 if cur[cols[ti]] > 0.5 else 1.0
-                flips.append(ti)
-                changed = True
-                break
-            Fo = F.copy()
-            Fo[:, c0] = -np.inf
-            margin = F[:, c0] - Fo.max(1)  # pick the flip that erodes the class margin most
-            b = int(np.argmin(margin))
-            ti = remaining[b]
-            cur[cols[ti]] = 0.0 if cur[cols[ti]] > 0.5 else 1.0
-            flips.append(ti)
-            remaining.remove(ti)
-        words = [f'{"remove" if x[cols[ti]] > 0.5 else "add"} "{tcols[ti][2]}"' for ti in flips]
-        kr = bool(self._pred.proof(cur[None, :], 0)["class"] == self._pred.predict(cur[None, :])[0])
-        return {
-            "class": self._pred.classes_[c0],
-            "n_text_tokens": len(cols),
-            "certified_stable_to_1_word_change": len(breakers) == 0,  # EXACT over all single add/removes
-            "min_word_changes_to_flip": len(flips)
-            if changed
-            else None,  # greedy achievable bound (kernel-verified)
-            "flip_words": words if changed else [],
-            "kernel_reproduced": kr,
-            "note": "1-word stability is exact; min_word_changes_to_flip is a kernel-verified achievable "
-            "(greedy) bound. radius_iqr is omitted — undefined for binary token features.",
-        }
-
     def robustness(self, X, row, rel=0.1, delta=None):
         """Certified classification robustness: is the predicted class PROVABLY unable to flip for any input
         within ±delta of this row (exact score-interval domination — not sampling/attacks)? Returns the class,
         whether it's certified stable at that radius, the score margin, and the largest certified radius (as a
-        multiple of per-feature IQR). For TEXT models the IQR radius is undefined (binary tokens) → reports a
-        WORD Hamming radius instead (see `_text_robustness`). A finite posterior override is certified for
-        its row arithmetic but reports no unsupported continuous radius. Classification additive only."""
+        multiple of per-feature IQR). A finite posterior override is certified for its row arithmetic but reports
+        no unsupported continuous radius. Classification additive only."""
         self._require_fitted(modes={"classification"}, additive=True)
         Xe = self._X(X)
         evidence = self._decision_evidence_encoded(Xe, row)
@@ -10313,8 +9870,6 @@ class TabPVN:
                     "certificate is claimed across the class override."
                 ),
             }
-        if self._has_text():
-            return self._text_robustness(Xe, row)
         out = self._pred.certified_robustness(Xe, row, rel=rel, delta=delta)
         out["radius_iqr"] = self._pred.robust_radius(Xe, row)
         return out
@@ -10371,10 +9926,6 @@ class TabPVN:
                 o["feature"] = o["label"]
                 frm = o["from_level"] if o["from_level"] is not None else "—"
                 o["action"] = f"change {o['label']}: {frm} → {o['to_level']}"
-            elif o["kind"] == "text":
-                o["feature"] = o["label"]
-                verb, prep = ("add", "to") if o["add"] else ("remove", "from")
-                o["action"] = f'{verb} the word "{o["token"]}" {prep} {o["label"]}'
             else:
                 lab = o["label"] if isinstance(o["label"], str) else colname(o["col"])
                 o["feature"] = lab
@@ -10462,10 +10013,6 @@ class TabPVN:
                     "note": "No input-radius claim is attached to a class override.",
                 }
                 out["sufficient_reason"] = self._override_reason(evidence)
-            elif (
-                self._has_text()
-            ):  # word-Hamming robustness; the continuous IQR radius is undefined for tokens
-                out["robustness"] = self._text_robustness(encoded, row)
             else:
                 rob = self._pred.certified_robustness(encoded, row)
                 rob["radius_iqr"] = self._pred.robust_radius(encoded, row)
@@ -10555,7 +10102,7 @@ class TabPVN:
         return 0.0
 
 
-_ADAPTER_EXPORTS = {"TabPVNMultiOutput", "TabPVNOrdinal", "TabPVNTextPair"}
+_ADAPTER_EXPORTS = {"TabPVNMultiOutput", "TabPVNOrdinal"}
 
 
 def __getattr__(name: str):

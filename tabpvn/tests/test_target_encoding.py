@@ -21,7 +21,7 @@ def test_unique_category_ids_do_not_leak_their_training_label():
     assert np.allclose(prep.transform(pd.DataFrame({"customer": ["new-id"]})), 0.0)
 
 
-def test_structured_identifiers_reuse_stable_tokens_automatically():
+def test_structured_identifiers_remain_exact_categories_without_component_tokens():
     identifiers = [
         f"WC-{year}_{team}"
         for year in (2002, 2006, 2010, 2014, 2018)
@@ -33,14 +33,13 @@ def test_structured_identifiers_reuse_stable_tokens_automatically():
 
     prep.fit_transform(frame, target)
     query = prep.transform(pd.DataFrame({"ID": ["WC-2026_ARG", "WC-2026_NEW"]}))
-    argentina = prep.names.index("ID__token=arg")
 
-    assert prep.structured_id_cols == ["ID"]
-    assert "ID" in prep.text_cols
-    assert "ID" not in prep.cat_cols
-    assert not any("~" in name for name in prep.names)
-    assert query[0, argentina] == 1.0
-    assert query[1, argentina] == 0.0
+    assert prep.byte_cols == []
+    assert prep.cat_cols == ["ID"]
+    assert len(prep.names) == len(identifiers)
+    assert all(name.startswith("ID=") for name in prep.names)
+    assert not any("token" in name or "~" in name for name in prep.names)
+    np.testing.assert_array_equal(query, np.zeros((2, len(identifiers))))
 
 
 def test_repeated_categories_keep_only_out_of_fold_target_signal():

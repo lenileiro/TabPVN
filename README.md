@@ -20,8 +20,9 @@ pretrained black-box prior?
 
 TabPVN uses no hosted model, pretrained checkpoint, or training-time neural
 network. The default `fit` path automatically handles numeric and categorical
-columns, missing values, text-like fields, imbalanced targets, and repeated
-entity-event tables. Candidate components are deployed only when bounded
+columns, missing values, raw UTF-8 byte fields, imbalanced targets, and repeated
+entity-event tables. Byte fields are processed without a learned token vocabulary
+or stored-row retrieval. Candidate components are deployed only when bounded
 out-of-fold or future-window evidence admits them.
 
 > TabPVN proofs verify model execution and declared statistical evidence. They do
@@ -424,7 +425,7 @@ flowchart LR
 ```
 
 1. **Compile the table.** Raw pandas and NumPy inputs become deterministic numeric,
-   categorical, missingness, text, relation, or temporal facts.
+   categorical, missingness, byte-sequence, relation, or temporal facts.
 2. **Propose bounded improvements.** The certified additive booster can be
    complemented by explicit categorical posteriors, numeric interval evidence,
    affine reads, compression evidence, or causal temporal state.
@@ -442,7 +443,7 @@ flowchart LR
 | --- | --- |
 | Classification | Binary and multiclass prediction with calibrated probabilities |
 | Regression | Point prediction with conformal error bounds when calibration is available |
-| Raw schemas | pandas and NumPy inputs, categoricals, missing values, datetime, and bounded text evidence |
+| Raw schemas | pandas and NumPy inputs, categoricals, missing values, datetime, and bounded UTF-8 byte evidence without tokenization |
 | Imbalance | Rare-event sampling, average-precision gates, and explicit operating points |
 | Event tables | Automatic entity/time discovery with causal future-window validation |
 | Explanations | Typed conditions, sufficient reasons, stability, recourse, and proof artifacts |

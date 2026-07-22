@@ -2,8 +2,6 @@
 
 import ast
 import pathlib
-import subprocess
-import sys
 import tomllib
 
 import numpy as np
@@ -63,7 +61,7 @@ def test_default_proposer_registry_names_are_unique_and_ordered():
     assert "multiclass_residual_stump_head" in names
     assert "stratified_scenario_verifier" in names
     assert "multiclass_residual_predicate_boost" in names
-    assert names[-8:] == (
+    assert names[-7:] == (
         "smooth_knn",
         "hierarchical_proof_path_memory",
         "bayesian_expert_router",
@@ -71,7 +69,6 @@ def test_default_proposer_registry_names_are_unique_and_ordered():
         "categorical_posterior",
         "categorical_hypergraph_posterior",
         "numeric_interval_decision",
-        "sdm_attention",
     )
 
 
@@ -85,11 +82,6 @@ def test_preprocessing_and_adapters_have_independent_module_boundaries():
     assert LegacyMultiOutput is TabPVNMultiOutput
     assert _Preprocessor.__module__ == "tabpvn.preprocessing"
     assert TabPVNMultiOutput.__module__ == "tabpvn.adapters"
-
-
-def test_attention_does_not_import_the_estimator_module_at_import_time():
-    code = "import sys; import tabpvn.attention; assert 'tabpvn.base' not in sys.modules"
-    subprocess.run([sys.executable, "-c", code], check=True)
 
 
 def test_runtime_dependencies_point_inward_and_never_reach_research_code():

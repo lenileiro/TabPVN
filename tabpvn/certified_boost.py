@@ -909,27 +909,7 @@ def _recourse_search(pred_fn, goal, x, thr, scale, meta, max_options):
     opts = []
     for g in groups:
         cols, kind = g["cols"], g.get("kind", "num")
-        if kind in ("isna", "encoded_category", "derived"):
-            continue
-        if kind == "text":  # bag-of-words token: flip presence (add/remove the word); does it reach the goal?
-            j = cols[0]
-            xp = x.copy()
-            xp[j] = 0.0 if x[j] > 0.5 else 1.0
-            out = pred_fn(xp[None, :])[0]
-            if goal(out):
-                opts.append(
-                    {
-                        "kind": "text",
-                        "label": g["label"],
-                        "token": g["token"],
-                        "col": j,
-                        "from": round(float(x[j]), 4),
-                        "to": float(xp[j]),
-                        "add": bool(xp[j] > 0.5),
-                        "cost": 1.0,
-                        "outcome": out,
-                    }
-                )
+        if kind in ("isna", "encoded_category", "derived", "byte_evidence"):
             continue
         if kind == "onehot":
             cur = next((c for c in cols if x[c] > 0.5), None)

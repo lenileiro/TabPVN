@@ -49,14 +49,12 @@ def test_preprocessor_crossfits_and_selects_sequence_evidence():
     training = preprocessor.fit_transform(X, y)
     compression_columns = preprocessor.compression_indices["message"]
     inference = preprocessor.transform(X)
-    word_columns = [index for index, name in enumerate(preprocessor.names) if "~" in str(name)]
 
+    assert preprocessor.byte_cols == ["message"]
     assert preprocessor.compression_enabled == {"message": True}
     assert preprocessor.compression_report[-1]["selected"] is True
     assert min(preprocessor.compression_report[-1]["fold_scores"]) > 0.99
-    # Paired rows contain the same word set, so only sequence evidence can
-    # distinguish their opposite ordering.
-    np.testing.assert_array_equal(training[:80, word_columns], training[80:, word_columns])
+    assert not any("token" in str(name) or "~" in str(name) for name in preprocessor.names)
     assert not np.allclose(
         training[:, compression_columns],
         inference[:, compression_columns],
@@ -78,6 +76,7 @@ def test_preprocessor_rejects_balanced_text_without_sequence_signal():
     assert preprocessor.compression_report[0]["reason"] == "no_repeated_discriminative_phrases"
     assert preprocessor.compression_report[0]["reference_bytes_per_class"] > 0
     assert not any("__compression" in str(name) for name in preprocessor.names)
+    assert preprocessor.names == ["message__freq"]
     assert encoded.shape[1] == len(preprocessor.names)
 
 
@@ -121,5 +120,9 @@ def test_tabpvn_deploys_compression_features_inside_certified_booster():
     assert any("__compression_bits" in str(name) for name in model.feature_names_)
     assert model.score(X, y) == 1.0
     assert model.certify(X.iloc[:20]) == 1.0
+    groups, metadata, _widen = model._reason_groups()
+    assert sorted(column for group in groups for column in group) == list(range(len(model.feature_names_)))
+    assert any(group["kind"] == "byte_evidence" for group in metadata)
+    assert "byte evidence" in model.reason(X.iloc[:1], 0)["rule"]
     restored = pickle.loads(pickle.dumps(model, protocol=pickle.HIGHEST_PROTOCOL))
     np.testing.assert_array_equal(restored.predict(X.iloc[:20]), model.predict(X.iloc[:20]))

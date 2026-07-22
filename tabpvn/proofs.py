@@ -449,32 +449,6 @@ def _affine_evidence(
     return evidence
 
 
-def _attention_evidence(payload: Mapping[str, Any], limit: int = 5) -> list[dict[str, Any]]:
-    terms = payload.get("attention_terms", payload.get("attended", []))
-    if not isinstance(terms, (list, tuple)):
-        return []
-    evidence: list[dict[str, Any]] = []
-    for rank, term in enumerate(terms[:limit], start=1):
-        if isinstance(term, Mapping):
-            row, similarity = term.get("row"), term.get("similarity")
-            target = term.get("target")
-        elif isinstance(term, (list, tuple)) and len(term) == 3:
-            row, similarity, target = term
-        else:
-            continue
-        evidence.append(
-            {
-                "id": f"prediction-{rank}",
-                "kind": "retrieved_example",
-                "label": f"Training row {row}",
-                "conditions": [],
-                "effect": f"similarity {_format_value(similarity)}, target {_format_value(target)}",
-                "verified": None,
-            }
-        )
-    return evidence
-
-
 def _prediction_evidence(
     payload: Any,
     feature_names: Sequence[Any] | None,
@@ -486,31 +460,8 @@ def _prediction_evidence(
         return _affine_evidence(payload, feature_names, verified)
     if payload.get("kind") in _POSTERIOR_KINDS:
         return _posterior_evidence(payload, verified)
-    if payload.get("kind") == "regression_blend":
-        base_proof = payload.get("base_proof")
-        evidence = _additive_evidence(base_proof, feature_names) if isinstance(base_proof, Mapping) else []
-        base, member = payload.get("base"), payload.get("member")
-        if isinstance(base, Mapping) and isinstance(member, Mapping):
-            evidence.append(
-                {
-                    "id": f"prediction-{len(evidence) + 1}",
-                    "kind": "prediction_blend",
-                    "label": "Accuracy blend",
-                    "conditions": [],
-                    "effect": (
-                        f"combines {_format_value(base.get('prediction'))} at "
-                        f"{100.0 * float(base.get('weight', 0.0)):.1f}% with "
-                        f"{_format_value(member.get('prediction'))} at "
-                        f"{100.0 * float(member.get('weight', 0.0)):.1f}%"
-                    ),
-                    "verified": verified,
-                }
-            )
-        return evidence
     if "terms_shown" in payload:
         return _additive_evidence(payload, feature_names)
-    if "attended" in payload or "attention_terms" in payload:
-        return _attention_evidence(payload)
     node = payload.get("proof")
     if node is None:
         return []
@@ -609,15 +560,11 @@ def _proof_count(payload: Any) -> int:
         return 1
     if payload.get("kind") == _AFFINE_DECISION_KIND:
         return _proof_count(payload.get("base_proof")) + 1
-    if payload.get("kind") == "regression_blend":
-        return _proof_count(payload.get("base_proof")) + 1
     terms = payload.get("terms_shown")
     if isinstance(terms, (list, tuple)):
         return sum(isinstance(term, Mapping) and term.get("proof") is not None for term in terms)
     if "sigma_proof" in payload:
         return _proof_count(payload.get("sigma_proof"))
-    if "attention_terms" in payload and payload.get("kind") == "attention_regression":
-        return 1
     return int(payload.get("proof") is not None)
 
 
@@ -628,10 +575,6 @@ def _verification_scope(payload: Any) -> tuple[str, dict[str, int] | None]:
         return "posterior_arithmetic", None
     if payload.get("kind") == _AFFINE_DECISION_KIND:
         return "affine_arithmetic_and_shown_region_memberships", None
-    if payload.get("kind") == "regression_blend":
-        return "blend_arithmetic_and_shown_region_memberships", None
-    if payload.get("kind") in {"attention_classification", "attention_regression"}:
-        return "attention_decision", None
     terms = payload.get("terms_shown")
     total = payload.get("n_stages")
     if isinstance(terms, (list, tuple)) and isinstance(total, int):
@@ -658,10 +601,6 @@ def _verification_statement(scope: str, coverage: Mapping[str, int] | None, veri
         )
     if scope == "posterior_arithmetic":
         return "The finite counts, posterior update, and resulting class were recomputed."
-    if scope == "attention_decision":
-        return "The included attention vote or weighted regression read was recomputed."
-    if scope == "blend_arithmetic_and_shown_region_memberships":
-        return "The blend arithmetic and the booster's shown region memberships were recomputed."
     if scope == "affine_arithmetic_and_shown_region_memberships":
         return (
             "The affine logits, sigmoid/softmax, probability blend, final class, and the incumbent's shown "
@@ -691,15 +630,10 @@ def _summary(
             f" OOF-authorized affine evidence changed the base prediction from {base}; "
             "its linear arithmetic and blend passed verification."
         )
-    elif isinstance(payload, Mapping) and payload.get("kind") == "regression_blend":
-        detail = " The result combines the certified booster with an OOF-admitted accuracy member."
     elif isinstance(payload, Mapping) and "terms_shown" in payload:
         shown = len(payload.get("terms_shown", []))
         total = payload.get("n_stages", shown)
         detail = f" {shown} shown region memberships passed verification out of {total} model stages."
-    elif isinstance(payload, Mapping) and ("attended" in payload or "attention_terms" in payload):
-        count = payload.get("n_attended", len(payload.get("attended", [])))
-        detail = f" The decision uses a weighted read over {count} retrieved training rows."
     else:
         detail = " The included logical evidence passed verification." if verified else ""
     if guarantee is not None:
@@ -972,11 +906,9 @@ def _public_outcome(artifact: Mapping[str, Any]) -> dict[str, Any]:
 
 def _public_reasons(artifact: Mapping[str, Any], prediction: Any) -> list[dict[str, Any]]:
     descriptions = {
-        "retrieved_example": "Similar historical examples support this prediction.",
         "finite_count_posterior": "Comparable historical outcomes support this prediction.",
         "affine_probability_decision": "The overall feature pattern supports this prediction.",
         "decision_region": "The model baseline supports this prediction.",
-        "prediction_blend": "Multiple validated signals support this prediction.",
         "logical_derivation": "The observed feature values support this prediction.",
     }
     reasons: list[dict[str, Any]] = []
@@ -1237,75 +1169,6 @@ def proof_response_matches_artifact(response: Any, artifact: Any) -> bool:
         return False
 
 
-def _verify_attention_classification(
-    payload: Mapping[str, Any], verify_nested: Callable[[Any], bool]
-) -> bool:
-    try:
-        terms = payload["attention_terms"]
-        classes = list(payload["classes"])
-        if not isinstance(terms, (list, tuple)) or len(terms) != int(payload["n_attended"]) or not classes:
-            return False
-        votes = [0.0] * len(classes)
-        for term in terms:
-            similarity = float(term["similarity"])
-            if not math.isfinite(similarity):
-                return False
-            votes[classes.index(term["target"])] += similarity
-        winner = classes[max(range(len(votes)), key=votes.__getitem__)]
-        return bool(winner == payload["class"] and verify_nested(payload["proof"]))
-    except (KeyError, TypeError, ValueError):
-        return False
-
-
-def _verify_attention_regression(payload: Mapping[str, Any]) -> bool:
-    try:
-        terms = payload["attention_terms"]
-        if not isinstance(terms, (list, tuple)) or len(terms) != int(payload["n_attended"]):
-            return False
-        similarities = [float(term["similarity"]) for term in terms]
-        targets = [float(term["target"]) for term in terms]
-        weighted_sum = float(payload["weighted_sum"])
-        weight_sum = float(payload["weight_sum"])
-        prediction = float(payload["prediction"])
-        values = similarities + targets + [weighted_sum, weight_sum, prediction]
-        return bool(
-            all(math.isfinite(value) for value in values)
-            and math.isclose(
-                weighted_sum, sum(w * target for w, target in zip(similarities, targets, strict=True))
-            )
-            and math.isclose(weight_sum, sum(similarities))
-            and math.isclose(prediction, weighted_sum / (weight_sum + 1e-12))
-        )
-    except (KeyError, TypeError, ValueError, ZeroDivisionError):
-        return False
-
-
-def _verify_regression_blend(payload: Mapping[str, Any], verify_nested: Callable[[Any], bool]) -> bool:
-    try:
-        base = payload["base"]
-        member = payload["member"]
-        base_weight = float(base["weight"])
-        member_weight = float(member["weight"])
-        base_prediction = float(base["prediction"])
-        member_prediction = float(member["prediction"])
-        prediction = float(payload["prediction"])
-        base_proof = payload["base_proof"]
-        proof_prediction_value = float(base_proof["prediction"])
-        values = [base_weight, member_weight, base_prediction, member_prediction, prediction]
-        return bool(
-            all(math.isfinite(value) for value in values)
-            and math.isclose(base_weight + member_weight, 1.0)
-            and math.isclose(base_prediction, proof_prediction_value)
-            and math.isclose(
-                prediction,
-                base_weight * base_prediction + member_weight * member_prediction,
-            )
-            and verify_nested(base_proof)
-        )
-    except (KeyError, TypeError, ValueError):
-        return False
-
-
 def _verify_sigma(payload: Mapping[str, Any], verify_nested: Callable[[Any], bool]) -> bool:
     try:
         sigma, q, bound = float(payload["sigma"]), float(payload["q"]), float(payload["bound"])
@@ -1348,12 +1211,6 @@ def verify_structured_payload(
     kind = payload.get("kind")
     if kind in {"observed_target_attestation", "signed_target_attestation"}:
         return verify_attestation_payload(payload, trusted_attestation_keys)
-    if kind == "attention_classification":
-        return _verify_attention_classification(payload, verify_nested)
-    if kind == "attention_regression":
-        return _verify_attention_regression(payload)
-    if kind == "regression_blend":
-        return _verify_regression_blend(payload, verify_nested)
     if kind == _AFFINE_DECISION_KIND:
         from tabpvn.proposers.affine import AffineLogitRead
 

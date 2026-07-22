@@ -13,7 +13,6 @@ from tabpvn import (
     TabPVN,
     TabPVNMultiOutput,
     TabPVNOrdinal,
-    TabPVNTextPair,
     TabularDecisionClient,
     load_model,
     save_model,
@@ -171,7 +170,3 @@ def test_composed_estimators_validate_their_input_contracts():
         TabPVNMultiOutput().fit(np.zeros((2, 1)), np.empty((2, 0)))
     with pytest.raises(ValueError, match="one-dimensional"):
         TabPVNOrdinal().fit(np.zeros((2, 1)), np.zeros((2, 1)))
-    with pytest.raises(ValueError, match="positive integer"):
-        TabPVNTextPair(max_tokens=0)
-    with pytest.raises(ValueError, match="same number of rows"):
-        TabPVNTextPair().fit(["a"], [], np.array([0]))

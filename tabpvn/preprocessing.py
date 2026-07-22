@@ -1,15 +1,13 @@
 """Deterministic preprocessing for TabPVN's tabular estimators.
 
-This module owns raw-table schema compilation. It intentionally contains no
-predictor imports, which keeps preprocessing reusable by both ``TabPVN`` and
-``CertifiedAttention`` without creating a dependency cycle.
+This module owns raw-table schema compilation. String values retain exact
+categorical semantics; optional sequence evidence is computed directly from
+bounded UTF-8 bytes without a learned vocabulary or stored-row retrieval.
 """
 
 from __future__ import annotations
 
-import re
 import warnings
-from collections import Counter
 from typing import Any, Literal, Self
 
 import numpy as np
@@ -195,127 +193,18 @@ def target_encode(
     return encoded_train, encoded_test
 
 
-_TOKEN_RE = re.compile(r"[a-z0-9]{2,}")
-
-
-def _tokenize(value: Any) -> list[str]:
-    return _TOKEN_RE.findall(value.lower()) if isinstance(value, str) else []
-
-
-def _looks_like_structured_identifier(series: Any) -> bool:
-    """Return whether a high-cardinality string column contains reusable ID parts."""
+def _is_byte_evidence_candidate(series: Any) -> bool:
+    """Return whether a column has enough raw UTF-8 material to verify byte evidence."""
     values = series.dropna().astype(str)
-    if len(values) < 8 or values.nunique() < 8 or values.nunique() / len(values) < 0.5:
+    if len(values) < 8 or values.nunique() <= 20:
         return False
-    sample = values.sample(min(len(values), 1_000), random_state=0)
-    if sample.str.contains(r"[-_:/]", regex=True).mean() < 0.8:
-        return False
-    documents = [_tokenize(value) for value in sample]
-    token_counts = np.asarray([len(tokens) for tokens in documents], dtype=int)
-    if np.mean((token_counts >= 2) & (token_counts <= 8)) < 0.8:
-        return False
-    frequency = Counter(token for tokens in documents for token in set(tokens))
-    maximum_reusable_frequency = 0.8 * len(documents)
-    return any(2 <= count <= maximum_reusable_frequency for count in frequency.values())
-
-
-class _TextFeaturizer:
-    """Deterministic binary bag-of-words featurizer for one text column."""
-
-    def __init__(self, max_features: int = 300):
-        if max_features <= 0:
-            raise ValueError("max_features must be positive")
-        self.max_features = int(max_features)
-
-    def _docsets(self, series: Any) -> tuple[NDArray[Any], list[set[str]]]:
-        values = series.astype("object").where(series.notna(), "").to_numpy()
-        return values, [set(_tokenize(value)) for value in values]
-
-    def fit(
-        self,
-        series: Any,
-        y: Any = None,
-        is_classification: bool | None = None,
-    ) -> Self:
-        _, documents = self._docsets(series)
-        n_documents = max(1, len(documents))
-        document_frequency: dict[str, int] = {}
-        for tokens in documents:
-            for token in tokens:
-                document_frequency[token] = document_frequency.get(token, 0) + 1
-
-        target_is_classification = (
-            _is_classification(np.asarray(y))
-            if y is not None and is_classification is None
-            else bool(is_classification)
-        )
-        is_regression = y is not None and not target_is_classification
-        minimum_frequency = 2 if is_regression else max(2, int(0.005 * n_documents))
-        maximum_frequency = (0.9 if is_regression else 0.5) * n_documents
-        candidates = [
-            token
-            for token, count in document_frequency.items()
-            if minimum_frequency <= count <= maximum_frequency
-        ]
-        candidate_set = set(candidates)
-
-        if candidates and y is not None and target_is_classification:
-            target = np.asarray(y)
-            classes = sorted(set(target.tolist()))
-            class_index = {value: index for index, value in enumerate(classes)}
-            encoded_target = np.array([class_index[value] for value in target])
-            class_count = len(classes)
-            totals = np.bincount(encoded_target, minlength=class_count).astype(float)
-            present_by_class = {token: np.zeros(class_count) for token in candidates}
-            for row, tokens in enumerate(documents):
-                target_class = encoded_target[row]
-                for token in tokens:
-                    if token in candidate_set:
-                        present_by_class[token][target_class] += 1.0
-
-            def chi_squared(token: str) -> float:
-                observed_present = present_by_class[token]
-                present = observed_present.sum()
-                observed_absent = totals - observed_present
-                expected_present = present * totals / n_documents
-                expected_absent = (n_documents - present) * totals / n_documents
-                return float(
-                    np.sum((observed_present - expected_present) ** 2 / (expected_present + 1e-9))
-                    + np.sum((observed_absent - expected_absent) ** 2 / (expected_absent + 1e-9))
-                )
-
-            candidates.sort(key=lambda token: (-chi_squared(token), token))
-        elif candidates and y is not None:
-            centered_target = np.asarray(y, dtype=float) - float(np.mean(y))
-            target_scale = float(np.std(centered_target)) + 1e-9
-            target_sum = dict.fromkeys(candidates, 0.0)
-            for row, tokens in enumerate(documents):
-                for token in tokens:
-                    if token in candidate_set:
-                        target_sum[token] += centered_target[row]
-
-            def correlation(token: str) -> float:
-                present = document_frequency[token]
-                denominator = np.sqrt(present * (n_documents - present)) * target_scale + 1e-9
-                return abs(target_sum[token]) / denominator
-
-            candidates.sort(key=lambda token: (-correlation(token), token))
-        else:
-            candidates.sort(key=lambda token: (-document_frequency[token], token))
-
-        self.vocab = candidates[: self.max_features]
-        self.tok2col = {token: index for index, token in enumerate(self.vocab)}
-        return self
-
-    def transform(self, series: Any) -> NDArray[np.float64]:
-        values, documents = self._docsets(series)
-        output = np.zeros((len(values), len(self.vocab)))
-        for row, tokens in enumerate(documents):
-            for token in tokens:
-                column = self.tok2col.get(token, -1)
-                if column >= 0:
-                    output[row, column] = 1.0
-        return output
+    sample = values.sample(min(len(values), 4_096), random_state=0)
+    lengths = np.fromiter(
+        (len(value.encode("utf-8", errors="replace")) for value in sample),
+        dtype=np.int64,
+        count=len(sample),
+    )
+    return int(lengths.sum()) >= 2_048 and float(np.median(lengths)) >= 24.0
 
 
 class _DateTimeFeaturizer:
@@ -617,14 +506,9 @@ class _Preprocessor:
                     f"{column}__target={label}"
                     for label in self.target_encoding.get(column, {}).get("labels", [])
                 ]
-        text_names = [
-            (f"{column}__token={token}" if column in self.structured_id_cols else f"{column}~{token}")
-            for column in self.text_cols
-            for token in self.text_feat[column].vocab
-        ]
         compression_names = [
             name
-            for column in self.text_cols
+            for column in self.byte_cols
             if self.compression_enabled.get(column, False)
             for name in self.compression_maps[column].feature_names(column)
         ]
@@ -633,7 +517,6 @@ class _Preprocessor:
             + datetime_names
             + [f"{column}__isna" for column in self.na_cols]
             + category_names
-            + text_names
             + compression_names
         )
         self.target_indices = {}
@@ -653,9 +536,8 @@ class _Preprocessor:
                     width = len(self.target_encoding[column]["prior"])
                     self.target_indices[column] = np.arange(offset, offset + width)
                     offset += width
-        offset += len(text_names)
         self.compression_indices = {}
-        for column in self.text_cols:
+        for column in self.byte_cols:
             if self.compression_enabled.get(column, False):
                 width = self.compression_maps[column].n_features_out_
                 self.compression_indices[column] = np.arange(offset, offset + width)
@@ -700,39 +582,20 @@ class _Preprocessor:
             and (self.task == "classification" or (self.task == "auto" and _is_classification(np.asarray(y))))
         )
 
-        self.text_cols = []
-        self.structured_id_cols = []
-        self.text_feat = {}
-        self.cat_cols = []
-        for column in (
+        self.cat_cols = list(
             column
             for column in frame.columns
             if column not in self.num_cols and column not in self.datetime_cols
-        ):
-            series = frame[column].dropna().astype(str)
-            sample = series.sample(min(len(series), 1000), random_state=0) if len(series) else series
-            mean_tokens = float(np.mean([len(_tokenize(value)) for value in sample])) if len(sample) else 0.0
-            structured_identifier = _looks_like_structured_identifier(frame[column])
-            if (mean_tokens >= 4 and frame[column].nunique(dropna=True) > 20) or structured_identifier:
-                self.text_cols.append(column)
-                if structured_identifier:
-                    self.structured_id_cols.append(column)
-                max_features = 1200 if y is not None and not self._target_is_classification else 300
-                self.text_feat[column] = _TextFeaturizer(max_features=max_features).fit(
-                    frame[column],
-                    y,
-                    is_classification=self._target_is_classification,
-                )
-            else:
-                self.cat_cols.append(column)
+        )
+        self.byte_cols = [
+            column for column in self.cat_cols if _is_byte_evidence_candidate(frame[column])
+        ]
 
         self.compression_maps = {}
         self.compression_enabled = {}
         self.compression_report = []
         if y is not None and self._target_is_classification and self.compression_evidence_enabled:
-            for column in self.text_cols:
-                if column in self.structured_id_cols:
-                    continue
+            for column in self.byte_cols:
                 try:
                     evidence_map = CompressionEvidenceMap().fit(frame[column].to_numpy(dtype=object), y)
                 except (TypeError, ValueError, FloatingPointError, OverflowError) as error:
@@ -775,7 +638,11 @@ class _Preprocessor:
                 self.onehot[column] = list(counts.index)
             else:
                 self.freq[column] = {key: value / len(frame) for key, value in counts.items()}
-                if y is not None and self.target_encoding_enabled:
+                if (
+                    y is not None
+                    and self.target_encoding_enabled
+                    and (not self._target_is_classification or column not in self.byte_cols)
+                ):
                     self.target_encoding[column] = self._target_stats(
                         values,
                         y,
@@ -867,9 +734,7 @@ class _Preprocessor:
                         encoded[:] = stats["prior"]
                     columns.append(encoded)
 
-        for column in self.text_cols:
-            columns.append(self.text_feat[column].transform(frame[column]))
-        for column in self.text_cols:
+        for column in self.byte_cols:
             if self.compression_enabled.get(column, False):
                 columns.append(self.compression_maps[column].transform(frame[column].to_numpy(dtype=object)))
         return np.column_stack(columns) if columns else np.zeros((n_rows, 0))
