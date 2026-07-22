@@ -2,12 +2,12 @@
 
 The certified booster remains the baseline predictor.  This module builds a
 small, auditable alternative from finite category facts: class counts for one
-category or a bounded pair of categories, shrunk toward the global class prior
-with a Dirichlet posterior. A bounded alternative can sequentially combine at
-most three non-overlapping factors. Sparse pairs can instead shrink toward the
-sequential posterior of their two single-category parents. The caller owns
-cross-fit admission; this primitive only fits evidence and performs the declared
-arithmetic.
+category, a bounded pair, or a separately gated three-category hyperedge,
+shrunk toward the global class prior with a Dirichlet posterior. A bounded
+alternative can sequentially combine at most three non-overlapping factors.
+Sparse conjunctions can instead shrink toward the sequential posterior of
+their single-category parents. The caller owns cross-fit admission; this
+primitive only fits evidence and performs the declared arithmetic.
 """
 
 from __future__ import annotations
@@ -55,17 +55,27 @@ class _EvidenceTable:
 class CategoricalPosteriorChallenger:
     """Dirichlet-smoothed evidence over atomic category facts.
 
-    Every query either selects its strongest supported single/category-pair
-    table or greedily pools at most three tables whose source groups do not
-    overlap. Pooling is the explicit conditional-independence approximation:
-    posterior/prior likelihood ratios are multiplied sequentially. A finite OOF
-    gate chooses smoothing, aggregation, and discount, rejecting correlated
-    evidence when that approximation does not transfer.
+    Every query either selects its strongest supported finite table or greedily
+    pools at most three tables whose source groups do not overlap. Pair-only
+    modes remain separate from bounded hypergraph modes, so three-way search
+    cannot suppress an incumbent pair candidate. Pooling is the explicit
+    conditional-independence approximation: posterior/prior likelihood ratios
+    are multiplied sequentially. A finite OOF gate chooses smoothing,
+    aggregation, and discount, rejecting correlated evidence when that
+    approximation does not transfer.
     """
 
-    AGGREGATIONS = ("strongest", "disjoint_pool")
+    BASE_AGGREGATIONS = ("strongest", "disjoint_pool")
+    HYPER_STRONGEST = "strongest_hyperedge"
+    HYPER_POOL = "hypergraph_pool"
+    HYPER_AGGREGATIONS = (HYPER_STRONGEST, HYPER_POOL)
+    AGGREGATIONS = BASE_AGGREGATIONS + HYPER_AGGREGATIONS
     SMOOTHING = ("global", "hierarchical")
     MAX_EVIDENCE_FACTORS = 3
+    MAX_HYPERGRAPH_FOCUS_GROUPS = 8
+    MAX_HYPEREDGE_FAMILIES = 12
+    MAX_HYPEREDGE_CARDINALITY = 4_096
+    MIN_HYPEREDGE_MDL_GAIN = 1e-9
 
     def __init__(
         self,
@@ -79,6 +89,7 @@ class CategoricalPosteriorChallenger:
         max_focus_groups: int = 16,
         aggregation: str = "strongest",
         smoothing: str = "global",
+        _hypergraph: bool = True,
     ):
         X, y = np.asarray(X, float), np.asarray(y)
         self.groups = tuple(tuple(int(column) for column in group) for group in groups)
@@ -91,8 +102,10 @@ class CategoricalPosteriorChallenger:
             raise ValueError("categorical posterior evidence needs at least two classes")
         if any(not group or max(group) >= X.shape[1] for group in self.groups):
             raise ValueError("category groups must reference columns in X")
-        if aggregation not in self.AGGREGATIONS:
-            raise ValueError(f"aggregation must be one of {self.AGGREGATIONS}")
+        self._hypergraph = bool(_hypergraph)
+        permitted_aggregations = self.AGGREGATIONS if self._hypergraph else self.BASE_AGGREGATIONS
+        if aggregation not in permitted_aggregations:
+            raise ValueError(f"aggregation must be one of {permitted_aggregations}")
         if smoothing not in self.SMOOTHING:
             raise ValueError(f"smoothing must be one of {self.SMOOTHING}")
         self.aggregation = aggregation
@@ -122,10 +135,62 @@ class CategoricalPosteriorChallenger:
         # Stable family ordering makes evidence selection and certificates
         # bit-identical even when mutual-information scores tie.
         self.tables = tuple(singles + sorted(selected_pairs, key=lambda table: table.family))
+        hyperedges = []
+        if self._hypergraph and len(self.groups) >= 3:
+            hyper_focus = self._focus_groups(singles, self.MAX_HYPERGRAPH_FOCUS_GROUPS)
+            for family in combinations(hyper_focus, 3):
+                cardinality = int(np.prod([len(self.groups[group]) for group in family]))
+                if cardinality > self.MAX_HYPEREDGE_CARDINALITY:
+                    continue
+                table = self._build_table(family)
+                parents = [
+                    (parent, self._marginal_counts(table, parent)) for parent in combinations(family, 2)
+                ]
+                parent_family, parent_counts = min(
+                    parents,
+                    key=lambda item: (-self._information(item[1]), item[0]),
+                )
+                parent_information = self._information(parent_counts)
+                excess_information = float(table.information - parent_information)
+                added_parameters = max(len(table.counts) - len(parent_counts), 0) * (self.C - 1)
+                support = max(sum(int(counts.sum()) for counts in table.counts.values()), 1)
+                mdl_penalty = 0.5 * added_parameters * np.log(max(support, 2)) / support
+                mdl_gain = float(excess_information - mdl_penalty)
+                if mdl_gain >= self.MIN_HYPEREDGE_MDL_GAIN:
+                    hyperedges.append(
+                        (mdl_gain, excess_information, float(mdl_penalty), parent_family, table)
+                    )
+        hyperedges.sort(key=lambda item: (-item[0], -item[1], -item[4].information, item[4].family))
+        selected_hyperedges = hyperedges[: self.MAX_HYPEREDGE_FAMILIES]
+        self.hyperedge_tables = tuple(
+            table for _gain, _excess, _penalty, _parent, table in selected_hyperedges
+        )
+        self.hyperedge_excess_information = {
+            table.family: float(excess) for _gain, excess, _penalty, _parent, table in selected_hyperedges
+        }
+        self.hyperedge_mdl_penalty = {
+            table.family: float(penalty) for _gain, _excess, penalty, _parent, table in selected_hyperedges
+        }
+        self.hyperedge_mdl_gain = {
+            table.family: float(gain) for gain, _excess, _penalty, _parent, table in selected_hyperedges
+        }
+        self.hyperedge_parent_family = {
+            table.family: tuple(parent) for _gain, _excess, _penalty, parent, table in selected_hyperedges
+        }
+        if aggregation in self.HYPER_AGGREGATIONS and not self.hyperedge_tables:
+            raise ValueError("hypergraph aggregation requires an MDL-supported hyperedge")
+        # Keep the finite candidate grid stable even when MDL rejects every
+        # triple. In that case the hypergraph modes are exact aliases of their
+        # pair-only counterparts, preserving report ordering and tie behavior.
+        self.available_aggregations = permitted_aggregations
         self.single_tables = {table.family[0]: table for table in singles}
-        pair_support = [int(counts.sum()) for table in selected_pairs for counts in table.counts.values()]
+        conjunction_support = [
+            int(counts.sum())
+            for table in (*selected_pairs, *self.hyperedge_tables)
+            for counts in table.counts.values()
+        ]
         self.hierarchical_candidate = bool(
-            pair_support and float(np.median(pair_support)) <= max(6.0 * self.C, 8.0)
+            conjunction_support and float(np.median(conjunction_support)) <= max(6.0 * self.C, 8.0)
         )
 
     def _normalize_metadata(self, metadata):
@@ -176,8 +241,11 @@ class CategoricalPosteriorChallenger:
             for index in np.argsort(first_rows):
                 key = tuple(int(level) for level in valid_codes[first_rows[index]])
                 counts[key] = class_counts[index].astype(np.int64, copy=False)
+        return _EvidenceTable(family=family, counts=counts, information=self._information(counts))
+
+    def _information(self, counts):
+        total = float(sum(bucket.sum() for bucket in counts.values()))
         information = 0.0
-        total = float(valid.sum())
         if total:
             for bucket in counts.values():
                 support = float(bucket.sum())
@@ -185,7 +253,19 @@ class CategoricalPosteriorChallenger:
                 positive = joint > 0
                 expected = (support / total) * self.prior
                 information += float(np.sum(joint[positive] * np.log(joint[positive] / expected[positive])))
-        return _EvidenceTable(family=family, counts=counts, information=information)
+        return information
+
+    @staticmethod
+    def _marginal_counts(table, family):
+        positions = tuple(table.family.index(group) for group in family)
+        counts: dict[tuple[int, ...], np.ndarray] = {}
+        for levels, bucket in table.counts.items():
+            key = tuple(levels[position] for position in positions)
+            if key in counts:
+                counts[key] = counts[key] + bucket
+            else:
+                counts[key] = bucket.copy()
+        return counts
 
     @staticmethod
     def _focus_groups(singles, limit):
@@ -273,12 +353,34 @@ class CategoricalPosteriorChallenger:
             match_cache[cache_key] = match
         return match
 
-    def _candidate_matches(self, code, smoothing=None, *, match_cache=None, single_cache=None):
+    @classmethod
+    def _base_aggregation(cls, aggregation):
+        if aggregation in {"strongest", cls.HYPER_STRONGEST}:
+            return "strongest"
+        if aggregation in {"disjoint_pool", cls.HYPER_POOL}:
+            return "disjoint_pool"
+        raise ValueError(f"unsupported categorical posterior aggregation: {aggregation}")
+
+    def _tables_for_aggregation(self, aggregation):
+        if aggregation in self.HYPER_AGGREGATIONS:
+            return self.tables + self.hyperedge_tables
+        return self.tables
+
+    def _candidate_matches(
+        self,
+        code,
+        smoothing=None,
+        *,
+        tables=None,
+        match_cache=None,
+        single_cache=None,
+    ):
         smoothing = self.smoothing if smoothing is None else smoothing
         if smoothing not in self.SMOOTHING:
             raise ValueError(f"smoothing must be one of {self.SMOOTHING}")
         matches = []
-        for table in self.tables:
+        source_tables = self.tables if tables is None else tables
+        for table in source_tables:
             levels = tuple(int(code[group]) for group in table.family)
             if any(level < 0 for level in levels):
                 continue
@@ -308,7 +410,8 @@ class CategoricalPosteriorChallenger:
         return tuple(match for _rank, match in matches)
 
     def _select_candidates(self, candidates, aggregation):
-        if aggregation == "strongest":
+        base_aggregation = self._base_aggregation(aggregation)
+        if base_aggregation == "strongest":
             return candidates[:1]
         selected = []
         used_groups: set[int] = set()
@@ -322,7 +425,14 @@ class CategoricalPosteriorChallenger:
         return tuple(selected)
 
     def _select_matches(self, code, aggregation, smoothing=None):
-        return self._select_candidates(self._candidate_matches(code, smoothing=smoothing), aggregation)
+        return self._select_candidates(
+            self._candidate_matches(
+                code,
+                smoothing=smoothing,
+                tables=self._tables_for_aggregation(aggregation),
+            ),
+            aggregation,
+        )
 
     def _match(self, code):
         selected = self._select_matches(code, "strongest", self.smoothing)
@@ -357,16 +467,19 @@ class CategoricalPosteriorChallenger:
         matches = []
         match_cache = {} if match_cache is None else match_cache
         single_cache = {} if single_cache is None else single_cache
+        tables = self._tables_for_aggregation(aggregation)
+        base_aggregation = self._base_aggregation(aggregation)
         for row, code in enumerate(unique_codes):
             candidates = self._candidate_matches(
                 code,
                 smoothing,
+                tables=tables,
                 match_cache=match_cache,
                 single_cache=single_cache,
             )
             selected = self._select_candidates(candidates, aggregation)
             if selected:
-                if aggregation == "strongest":
+                if base_aggregation == "strongest":
                     probabilities[row] = selected[0][4]
                 else:
                     probabilities[row] = self._pool_posteriors(self.prior, [match[4] for match in selected])
@@ -381,8 +494,8 @@ class CategoricalPosteriorChallenger:
     def posterior(self, X, *, return_matches=False, aggregation=None, smoothing=None):
         aggregation = self.aggregation if aggregation is None else aggregation
         smoothing = self.smoothing if smoothing is None else smoothing
-        if aggregation not in self.AGGREGATIONS:
-            raise ValueError(f"aggregation must be one of {self.AGGREGATIONS}")
+        if aggregation not in self.available_aggregations:
+            raise ValueError(f"aggregation must be one of {self.available_aggregations}")
         if smoothing not in self.SMOOTHING:
             raise ValueError(f"smoothing must be one of {self.SMOOTHING}")
         return self._posterior_from_codes(
@@ -402,22 +515,35 @@ class CategoricalPosteriorChallenger:
         single_cache=None,
     ):
         probabilities = {
-            aggregation: np.tile(self.prior, (len(unique_codes), 1)) for aggregation in self.AGGREGATIONS
+            aggregation: np.tile(self.prior, (len(unique_codes), 1))
+            for aggregation in self.available_aggregations
         }
         match_cache = {} if match_cache is None else match_cache
         single_cache = {} if single_cache is None else single_cache
         for row, code in enumerate(unique_codes):
-            candidates = self._candidate_matches(
+            base_candidates = self._candidate_matches(
                 code,
                 smoothing,
                 match_cache=match_cache,
                 single_cache=single_cache,
             )
-            for aggregation in self.AGGREGATIONS:
+            hyper_candidates = (
+                self._candidate_matches(
+                    code,
+                    smoothing,
+                    tables=self.tables + self.hyperedge_tables,
+                    match_cache=match_cache,
+                    single_cache=single_cache,
+                )
+                if self.hyperedge_tables
+                else base_candidates
+            )
+            for aggregation in self.available_aggregations:
+                candidates = hyper_candidates if aggregation in self.HYPER_AGGREGATIONS else base_candidates
                 selected = self._select_candidates(candidates, aggregation)
                 if not selected:
                     continue
-                if aggregation == "strongest":
+                if self._base_aggregation(aggregation) == "strongest":
                     probabilities[aggregation][row] = selected[0][4]
                 else:
                     probabilities[aggregation][row] = self._pool_posteriors(
@@ -546,7 +672,8 @@ class CategoricalPosteriorChallenger:
         )
         order = self._compiled_candidate_order(self.tables, strengths, supports)
         probabilities = {
-            aggregation: np.tile(self.prior, (len(unique_codes), 1)) for aggregation in self.AGGREGATIONS
+            aggregation: np.tile(self.prior, (len(unique_codes), 1))
+            for aggregation in self.available_aggregations
         }
         if len(unique_codes):
             rows = np.arange(len(unique_codes))
@@ -581,6 +708,14 @@ class CategoricalPosteriorChallenger:
     ):
         smoothing = self.smoothing if smoothing is None else smoothing
         unique_codes, inverse = _unique_code_rows(codes)
+        if self._hypergraph:
+            return self._posterior_modes_from_unique_scalar(
+                unique_codes,
+                inverse,
+                smoothing=smoothing,
+                match_cache=match_cache,
+                single_cache=single_cache,
+            )
         lookups = len(unique_codes) * len(self.tables)
         working_bytes = lookups * (self.C * 8 + 32)
         if lookups < _BATCHED_POSTERIOR_MIN_LOOKUPS or working_bytes > _BATCHED_POSTERIOR_MAX_BYTES:
@@ -610,7 +745,7 @@ class CategoricalPosteriorChallenger:
         probabilities = {
             (smoothing, aggregation): np.tile(self.prior, (len(unique_codes), 1))
             for smoothing in self.SMOOTHING
-            for aggregation in self.AGGREGATIONS
+            for aggregation in self.available_aggregations
         }
         match_cache: dict[Any, Any] = {}
         single_cache: dict[Any, Any] = {}
@@ -633,11 +768,25 @@ class CategoricalPosteriorChallenger:
                 else global_candidates
             )
             for smoothing, candidates in candidate_modes.items():
-                for aggregation in self.AGGREGATIONS:
-                    selected = self._select_candidates(candidates, aggregation)
+                hyper_candidates = (
+                    self._candidate_matches(
+                        code,
+                        smoothing,
+                        tables=self.tables + self.hyperedge_tables,
+                        match_cache=match_cache,
+                        single_cache=single_cache,
+                    )
+                    if self.hyperedge_tables
+                    else candidates
+                )
+                for aggregation in self.available_aggregations:
+                    source_candidates = (
+                        hyper_candidates if aggregation in self.HYPER_AGGREGATIONS else candidates
+                    )
+                    selected = self._select_candidates(source_candidates, aggregation)
                     if not selected:
                         continue
-                    if aggregation == "strongest":
+                    if self._base_aggregation(aggregation) == "strongest":
                         probabilities[(smoothing, aggregation)][row] = selected[0][4]
                     else:
                         probabilities[(smoothing, aggregation)][row] = self._pool_posteriors(
@@ -731,10 +880,11 @@ class CategoricalPosteriorChallenger:
         conditions = [condition for factor in factors for condition in factor["conditions"]]
         base_index = int(base_probability[int(row)].argmax())
         prediction_index = int(combined[int(row)].argmax())
+        base_aggregation = self._base_aggregation(self.aggregation)
         record = {
             "kind": (
                 "categorical_dirichlet_posterior"
-                if self.aggregation == "strongest"
+                if base_aggregation == "strongest"
                 else "categorical_dirichlet_posterior_pool"
             ),
             "aggregation": self.aggregation,
@@ -754,7 +904,7 @@ class CategoricalPosteriorChallenger:
             "prediction": _python_scalar(self.classes[prediction_index]),
             "override": bool(base_index != prediction_index),
         }
-        if self.aggregation == "strongest":
+        if base_aggregation == "strongest":
             factor = (
                 factors[0]
                 if factors
@@ -857,7 +1007,7 @@ class CategoricalPosteriorChallenger:
                             or len(parent_conditions) != 1
                             or parent_conditions[0] != conditions[index]
                         ):
-                            raise ValueError("hierarchical parent does not match pair fact")
+                            raise ValueError("hierarchical parent does not match conjunction fact")
                         parent_posteriors.append(parent_posterior)
                     expected_prior = CategoricalPosteriorChallenger._pool_posteriors(prior, parent_posteriors)
                 if (
@@ -884,7 +1034,11 @@ class CategoricalPosteriorChallenger:
             family: list[int]
             conditions: list[dict[str, Any]]
             if record["kind"] == "categorical_dirichlet_posterior":
-                if record.get("aggregation", "strongest") != "strongest":
+                aggregation = record.get("aggregation", "strongest")
+                if aggregation not in {
+                    "strongest",
+                    CategoricalPosteriorChallenger.HYPER_STRONGEST,
+                }:
                     return False
                 posterior, family, conditions = verify_factor(
                     {
@@ -902,7 +1056,11 @@ class CategoricalPosteriorChallenger:
                 )
             else:
                 if (
-                    record.get("aggregation") != "disjoint_pool"
+                    record.get("aggregation")
+                    not in {
+                        "disjoint_pool",
+                        CategoricalPosteriorChallenger.HYPER_POOL,
+                    }
                     or int(record["maximum_factors"]) != CategoricalPosteriorChallenger.MAX_EVIDENCE_FACTORS
                 ):
                     return False
@@ -928,6 +1086,17 @@ class CategoricalPosteriorChallenger:
                     return False
                 posterior = CategoricalPosteriorChallenger._pool_posteriors(prior, posteriors)
 
+            aggregation = record.get("aggregation", "strongest")
+            if aggregation in CategoricalPosteriorChallenger.BASE_AGGREGATIONS and any(
+                len(factor_family) == 3
+                for factor_family in (
+                    [family]
+                    if record["kind"] == "categorical_dirichlet_posterior"
+                    else [list(factor["family"]) for factor in record["factors"]]
+                )
+            ):
+                return False
+
             base = np.asarray(record["base_probability"], float)[None, :]
             if base.shape != (1, len(classes)):
                 return False
@@ -951,12 +1120,32 @@ class CategoricalPosteriorChallenger:
         pairs = [table for table in self.tables if len(table.family) == 2]
         return {
             "groups": len(self.groups),
-            "families": len(self.tables),
+            "families": len(self.tables) + len(self.hyperedge_tables),
             "pair_families": len(pairs),
-            "patterns": int(sum(len(table.counts) for table in self.tables)),
+            "hypergraph_enabled": self._hypergraph,
+            "hyperedge_families": len(self.hyperedge_tables),
+            "hyperedge_family_limit": self.MAX_HYPEREDGE_FAMILIES,
+            "hyperedge_focus_group_limit": self.MAX_HYPERGRAPH_FOCUS_GROUPS,
+            "hyperedge_cardinality_limit": self.MAX_HYPEREDGE_CARDINALITY,
+            "hyperedge_excess_information": {
+                str(table.family): self.hyperedge_excess_information[table.family]
+                for table in self.hyperedge_tables
+            },
+            "hyperedge_mdl_penalty": {
+                str(table.family): self.hyperedge_mdl_penalty[table.family] for table in self.hyperedge_tables
+            },
+            "hyperedge_mdl_gain": {
+                str(table.family): self.hyperedge_mdl_gain[table.family] for table in self.hyperedge_tables
+            },
+            "hyperedge_parent_family": {
+                str(table.family): list(self.hyperedge_parent_family[table.family])
+                for table in self.hyperedge_tables
+            },
+            "patterns": int(sum(len(table.counts) for table in self.tables + self.hyperedge_tables)),
             "prior_strength": self.prior_strength,
             "minimum_support": self.minimum_support,
             "aggregation": self.aggregation,
+            "aggregations": list(self.available_aggregations),
             "smoothing": self.smoothing,
             "hierarchical_candidate": self.hierarchical_candidate,
             "maximum_factors": self.MAX_EVIDENCE_FACTORS,
@@ -980,7 +1169,7 @@ class NumericIntervalPosteriorChallenger:
     MAX_TRIPLE_FEATURES = 8
     MAX_TRIPLE_FAMILIES = 12
     TRIPLE_FALLBACK = "strongest_triple_fallback"
-    BASE_AGGREGATIONS = CategoricalPosteriorChallenger.AGGREGATIONS
+    BASE_AGGREGATIONS = CategoricalPosteriorChallenger.BASE_AGGREGATIONS
     AGGREGATIONS = BASE_AGGREGATIONS + (TRIPLE_FALLBACK,)
     SMOOTHING = CategoricalPosteriorChallenger.SMOOTHING
 
@@ -1044,6 +1233,7 @@ class NumericIntervalPosteriorChallenger:
             metadata=metadata,
             aggregation=delegate_aggregation,
             smoothing=smoothing,
+            _hypergraph=False,
         )
         singles = [table for table in self._delegate.tables if len(table.family) == 1]
         focus = self._delegate._focus_groups(singles, self.MAX_TRIPLE_FEATURES)
@@ -1411,6 +1601,15 @@ class NumericIntervalPosteriorChallenger:
         return record
 
     @staticmethod
+    def _categorical_verification_record(record, categorical_kind, decision_mode):
+        """Translate a numeric certificate to the categorical arithmetic schema."""
+        delegated = copy.deepcopy(record)
+        delegated["kind"] = categorical_kind
+        if decision_mode == NumericIntervalPosteriorChallenger.TRIPLE_FALLBACK:
+            delegated["aggregation"] = CategoricalPosteriorChallenger.HYPER_STRONGEST
+        return delegated
+
+    @staticmethod
     def verify_evidence(record, tol=1e-9):
         """Recheck both interval membership and delegated count arithmetic."""
         try:
@@ -1505,8 +1704,11 @@ class NumericIntervalPosteriorChallenger:
             elif "fallback_incumbent" in record:
                 return False
 
-            delegated = copy.deepcopy(record)
-            delegated["kind"] = kinds[record["kind"]]
+            delegated = NumericIntervalPosteriorChallenger._categorical_verification_record(
+                record,
+                kinds[record["kind"]],
+                decision_mode,
+            )
             return CategoricalPosteriorChallenger.verify_evidence(delegated, tol=tol)
         except (KeyError, TypeError, ValueError, IndexError):
             return False

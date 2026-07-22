@@ -139,6 +139,18 @@ def default_registry() -> CandidateRegistry:
                 "Bounded multiscale entity-history facts selected only after stable forward wins.",
             ),
             ProposerSpec(
+                "temporal_context_state",
+                "schema",
+                "strictly causal depth-two state followed by the shared future-window gate",
+                "Prior interarrival and marked-event order are emitted before atomic timestamp updates.",
+            ),
+            ProposerSpec(
+                "temporal_suffix_tree",
+                "schema",
+                "prequential depth-three trie with local MDL selection and a future-window gate",
+                "Variable-order marked-event regimes use hierarchical finite counts and timestamp-atomic updates.",
+            ),
+            ProposerSpec(
                 "auto_boost",
                 "predictor",
                 "certified additive booster",
@@ -155,6 +167,12 @@ def default_registry() -> CandidateRegistry:
                 "predictor",
                 "probability-ranking gate; class proof still comes from booster",
                 "Balanced class weighting selected only when OOF ROC-AUC improves.",
+            ),
+            ProposerSpec(
+                "stratified_scenario_verifier",
+                "candidate_verifier",
+                "correlated Latin-hypercube stress test over reused paired evidence",
+                "Candidate budgets favor stronger lower-tail validation utility while retaining the certified baseline and absolute leader.",
             ),
             ProposerSpec(
                 "rare_rank_checkpoint",
@@ -179,6 +197,24 @@ def default_registry() -> CandidateRegistry:
                 "predictor",
                 "affine certified leaf intervals",
                 "Path-constrained linear/logit-linear leaves selected by held-out or OOF loss.",
+            ),
+            ProposerSpec(
+                "mdl_symbolic_beam",
+                "schema",
+                "fit-side codelength search followed by the shared two-fold booster gate",
+                "Signed higher-order Boolean programs pay description and proof cost before admission.",
+            ),
+            ProposerSpec(
+                "mdl_recursive_dnf",
+                "schema",
+                "fit-side recursive codelength search followed by an incremental two-fold booster gate",
+                "A bounded OR tree grows from two to three canonical conjunction branches only after paying structure and proof cost.",
+            ),
+            ProposerSpec(
+                "mdl_exception_program",
+                "schema",
+                "counterexample-guided fit-side MDL search followed by an incremental two-fold gate",
+                "A broad conjunction may subtract at most two locally compiled exception clauses with explicit replay.",
             ),
             ProposerSpec(
                 "symbolic_predicate_boost",
@@ -223,6 +259,18 @@ def default_registry() -> CandidateRegistry:
                 "Fold-local fixed/adaptive neighborhood with binary distance-concentration screening.",
             ),
             ProposerSpec(
+                "hierarchical_proof_path_memory",
+                "auxiliary_proba",
+                "cross-fit finite Dirichlet hierarchy; final class remains booster-certified",
+                "Sparse certified leaves back off recursively through exact ancestor path regions.",
+            ),
+            ProposerSpec(
+                "bayesian_expert_router",
+                "auxiliary_proba",
+                "cross-fit finite Beta context table; final class remains booster-certified",
+                "Category and proof-path memories run only in confidence contexts with transferable wins.",
+            ),
+            ProposerSpec(
                 "global_affine_rank",
                 "auxiliary_proba",
                 "cross-fit rank gate plus stricter paired top-1 permission",
@@ -233,6 +281,12 @@ def default_registry() -> CandidateRegistry:
                 "posterior_challenger",
                 "cross-fit rank-only or class-change permission over a Dirichlet count update",
                 "OOF-selected global/hierarchical shrinkage and strongest/pooled facts require paired evidence to correct classes.",
+            ),
+            ProposerSpec(
+                "categorical_hypergraph_posterior",
+                "posterior_challenger",
+                "bounded three-category count tables with separate cross-fit aggregation modes",
+                "Hyperedges require excess information over every pair and cannot displace pair-only candidates without an OOF win.",
             ),
             ProposerSpec(
                 "numeric_interval_decision",

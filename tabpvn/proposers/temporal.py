@@ -1,4 +1,4 @@
-"""Power-aware future-window gate for causal temporal Laplace evidence."""
+"""Power-aware future-window gate for causal temporal state evidence."""
 
 from __future__ import annotations
 
@@ -33,6 +33,8 @@ _RARE_EVENT_MAX_AUC_LOSS = 0.002
 _REGRESSION_MIN_RELATIVE_GAIN = 0.005
 _REGRESSION_MIN_PRACTICAL_GAIN = 0.001
 _REGRESSION_MAX_FORWARD_LOSS = 0.01
+_CONTEXT_CLASSIFICATION_MIN_GAIN = 0.0005
+_CONTEXT_REGRESSION_MIN_RELATIVE_GAIN = 0.001
 
 TemporalTask = Literal["classification", "regression"]
 
@@ -46,8 +48,16 @@ class TemporalEvidenceChallenger:
     practical gain is distinguishable from temporal sampling noise.
     """
 
-    def __init__(self, seed: int = 0) -> None:
+    def __init__(
+        self,
+        seed: int = 0,
+        *,
+        _context_state: bool = True,
+        _context_tree: bool = True,
+    ) -> None:
         self.seed = int(seed)
+        self._context_state = bool(_context_state)
+        self._context_tree = bool(_context_tree)
 
     def _window_rows(
         self,
@@ -693,6 +703,112 @@ class TemporalEvidenceChallenger:
             return "future_window_safeguard_failed"
         return "future_gain_confidence_not_established"
 
+    @staticmethod
+    def _incremental_context_win(
+        task: TemporalTask,
+        incumbent: dict[str, Any],
+        candidate: dict[str, Any],
+    ) -> tuple[bool, dict[str, Any]]:
+        """Require an incremental, forward-stable win over an accepted state."""
+        incumbent_selected = bool(incumbent["selected"])
+        candidate_selected = bool(candidate["selected"])
+        if task == "classification":
+            overall_gain = float(candidate["candidate_score"] - incumbent["candidate_score"])
+            minimum_gain = _CONTEXT_CLASSIFICATION_MIN_GAIN
+        else:
+            overall_gain = float(candidate["relative_gain"] - incumbent["relative_gain"])
+            minimum_gain = _CONTEXT_REGRESSION_MIN_RELATIVE_GAIN
+        forward_key = "forward_window_gains" if task == "classification" else "forward_window_relative_gains"
+        forward_deltas = [
+            float(candidate_gain - incumbent_gain)
+            for incumbent_gain, candidate_gain in zip(
+                incumbent[forward_key],
+                candidate[forward_key],
+                strict=True,
+            )
+            if incumbent_gain is not None and candidate_gain is not None
+        ]
+        required = max(1, int(np.ceil(len(forward_deltas) / 2.0)))
+        stable = bool(
+            forward_deltas
+            and sum(delta > 0.0 for delta in forward_deltas) >= required
+            and all(delta >= -minimum_gain for delta in forward_deltas)
+        )
+        selected = bool(
+            candidate_selected and (not incumbent_selected or (overall_gain >= minimum_gain and stable))
+        )
+        return selected, {
+            "incumbent_selected": incumbent_selected,
+            "candidate_selected_against_raw": candidate_selected,
+            "incremental_gain": overall_gain,
+            "minimum_incremental_gain": minimum_gain,
+            "forward_window_incremental_gains": forward_deltas,
+            "forward_stable": stable,
+        }
+
+    def _temporal_variant(
+        self,
+        past_events: Any,
+        valid_events: Any,
+        y_train: NDArray[Any],
+        *,
+        warmup_rows: int,
+        entity: Hashable,
+        timestamp: Hashable,
+        value_columns: Sequence[Hashable] | None,
+        drop_entity: bool,
+        task: TemporalTask,
+        context_state: bool,
+        context_tree: bool,
+    ) -> tuple[TemporalLaplaceMap, NDArray[np.float64], NDArray[np.float64]]:
+        temporal = TemporalLaplaceMap(
+            entity,
+            timestamp,
+            value_columns=value_columns,
+            _context_state=context_state,
+            _context_tree=context_tree,
+        )
+        candidate_past = temporal.fit_augment(past_events)
+        candidate_train = candidate_past.iloc[warmup_rows:].reset_index(drop=True)
+        candidate_valid = temporal.augment(valid_events)
+        candidate_train = self._model_frame(candidate_train, entity, drop_entity=drop_entity)
+        candidate_valid = self._model_frame(candidate_valid, entity, drop_entity=drop_entity)
+        encoded_train, encoded_valid = self._encode(
+            candidate_train,
+            candidate_valid,
+            y_train,
+            task,
+        )
+        return temporal, encoded_train, encoded_valid
+
+    def _variant_decision(
+        self,
+        task: TemporalTask,
+        baseline_train: NDArray[np.float64],
+        baseline_valid: NDArray[np.float64],
+        candidate_train: NDArray[np.float64],
+        candidate_valid: NDArray[np.float64],
+        y_train: NDArray[Any],
+        y_valid: NDArray[Any],
+        train_timestamps: NDArray[np.int64],
+        valid_timestamps: NDArray[np.int64],
+        local_windows: tuple[NDArray[np.int64], ...],
+        baseline_cache: dict[str, Any],
+    ) -> dict[str, Any]:
+        gate = self._classification_gate if task == "classification" else self._regression_gate
+        return gate(
+            baseline_train,
+            baseline_valid,
+            candidate_train,
+            candidate_valid,
+            y_train,
+            y_valid,
+            train_timestamps,
+            valid_timestamps,
+            local_windows,
+            baseline_cache,
+        )
+
     def evaluate(
         self,
         events: Any,
@@ -711,8 +827,15 @@ class TemporalEvidenceChallenger:
         target = np.asarray(y)
         if target.ndim != 1 or len(target) != len(events):
             raise ValueError("temporal evidence y must be one-dimensional and aligned with events")
+        consider_context = bool(self._context_state and value_columns is not None and len(value_columns) > 0)
+        consider_context_tree = bool(self._context_tree and consider_context)
 
-        probe = TemporalLaplaceMap(entity, timestamp, value_columns=value_columns)
+        probe = TemporalLaplaceMap(
+            entity,
+            timestamp,
+            value_columns=value_columns,
+            _context_state=self._context_state,
+        )
         frame, entity_codes, _, timestamps_ns = probe._extract(events)
         split = self._power_window_split(frame, entity_codes, timestamps_ns)
         if split is None:
@@ -748,26 +871,8 @@ class TemporalEvidenceChallenger:
         past_events = frame.iloc[past_rows].reset_index(drop=True)
         train_events = frame.iloc[train_rows].reset_index(drop=True)
         valid_events = frame.iloc[valid_rows].reset_index(drop=True)
-        temporal = TemporalLaplaceMap(entity, timestamp, value_columns=value_columns)
-        try:
-            candidate_past_frame = temporal.fit_augment(past_events)
-            candidate_train_frame = candidate_past_frame.iloc[len(warmup_rows) :].reset_index(drop=True)
-            candidate_valid_frame = temporal.augment(valid_events)
-        except ValueError as error:
-            return gate_report(
-                "temporal_laplace_evidence",
-                False,
-                stage="schema",
-                reason=f"future_window_ineligible:{error}",
-                source_rows=int(len(frame)),
-                train_rows=int(len(train_rows)),
-                valid_rows=int(len(valid_rows)),
-            )
-
         baseline_train_frame = self._model_frame(train_events, entity, drop_entity=drop_entity)
         baseline_valid_frame = self._model_frame(valid_events, entity, drop_entity=drop_entity)
-        candidate_train_frame = self._model_frame(candidate_train_frame, entity, drop_entity=drop_entity)
-        candidate_valid_frame = self._model_frame(candidate_valid_frame, entity, drop_entity=drop_entity)
         baseline_cache = {} if _baseline_cache is None else _baseline_cache
         encoded_baseline = baseline_cache.get("encoded")
         if encoded_baseline is None:
@@ -779,41 +884,147 @@ class TemporalEvidenceChallenger:
             )
             baseline_cache["encoded"] = encoded_baseline
         baseline_train, baseline_valid = encoded_baseline
-        candidate_train, candidate_valid = self._encode(
-            candidate_train_frame,
-            candidate_valid_frame,
-            y_train,
-            task,
-        )
-        if task == "classification":
-            decision = self._classification_gate(
-                baseline_train,
-                baseline_valid,
-                candidate_train,
-                candidate_valid,
-                y_train,
-                y_valid,
-                timestamps_ns[train_rows],
-                timestamps_ns[valid_rows],
-                local_windows,
-                baseline_cache,
+        variants: dict[str, tuple[TemporalLaplaceMap, dict[str, Any]]] = {}
+        context_error = None
+        context_tree_error = None
+        variant_specs = [("laplace", False, False)]
+        if consider_context:
+            variant_specs.append(("laplace_context", True, False))
+        if consider_context_tree:
+            variant_specs.append(("laplace_context_tree", True, True))
+        for name, context_state, context_tree in variant_specs:
+            try:
+                temporal, candidate_train, candidate_valid = self._temporal_variant(
+                    past_events,
+                    valid_events,
+                    y_train,
+                    warmup_rows=len(warmup_rows),
+                    entity=entity,
+                    timestamp=timestamp,
+                    value_columns=value_columns,
+                    drop_entity=drop_entity,
+                    task=task,
+                    context_state=context_state,
+                    context_tree=context_tree,
+                )
+            except ValueError as error:
+                if name == "laplace":
+                    return gate_report(
+                        "temporal_laplace_evidence",
+                        False,
+                        stage="schema",
+                        reason=f"future_window_ineligible:{error}",
+                        source_rows=int(len(frame)),
+                        train_rows=int(len(train_rows)),
+                        valid_rows=int(len(valid_rows)),
+                    )
+                variant_error = f"{type(error).__name__}:{error}"
+                if context_tree:
+                    context_tree_error = variant_error
+                else:
+                    context_error = variant_error
+                continue
+            variants[name] = (
+                temporal,
+                self._variant_decision(
+                    task,
+                    baseline_train,
+                    baseline_valid,
+                    candidate_train,
+                    candidate_valid,
+                    y_train,
+                    y_valid,
+                    timestamps_ns[train_rows],
+                    timestamps_ns[valid_rows],
+                    local_windows,
+                    baseline_cache,
+                ),
             )
-        else:
-            decision = self._regression_gate(
-                baseline_train,
-                baseline_valid,
-                candidate_train,
-                candidate_valid,
-                y_train,
-                y_valid,
-                timestamps_ns[train_rows],
-                timestamps_ns[valid_rows],
-                local_windows,
-                baseline_cache,
+
+        chosen_name = "laplace"
+        context_selected = False
+        context_comparison: dict[str, Any] = {
+            "considered": consider_context,
+            "selected": False,
+            "error": context_error,
+            "reason": (
+                "context_variant_error"
+                if context_error is not None
+                else (None if consider_context else "requires_marked_event_values")
+            ),
+        }
+        if "laplace_context" in variants:
+            context_selected, comparison = self._incremental_context_win(
+                task,
+                variants["laplace"][1],
+                variants["laplace_context"][1],
             )
+            comparison["laplace_selected"] = comparison["incumbent_selected"]
+            comparison["context_selected_against_raw"] = comparison["candidate_selected_against_raw"]
+            context_comparison.update(comparison)
+            context_comparison["selected"] = context_selected
+            context_comparison["reason"] = (
+                None
+                if context_selected
+                else (
+                    "context_future_gate_rejected"
+                    if not comparison["candidate_selected_against_raw"]
+                    else "context_incremental_gate_rejected"
+                )
+            )
+            context_comparison["laplace_candidate_score"] = float(variants["laplace"][1]["candidate_score"])
+            context_comparison["context_candidate_score"] = float(
+                variants["laplace_context"][1]["candidate_score"]
+            )
+            if context_selected:
+                chosen_name = "laplace_context"
+        context_tree_selected = False
+        context_tree_comparison: dict[str, Any] = {
+            "considered": consider_context_tree,
+            "selected": False,
+            "error": context_tree_error,
+            "reason": (
+                "context_tree_variant_error"
+                if context_tree_error is not None
+                else (None if consider_context_tree else "requires_context_state_and_marked_values")
+            ),
+        }
+        if "laplace_context_tree" in variants:
+            incumbent_name = chosen_name
+            context_tree_selected, comparison = self._incremental_context_win(
+                task,
+                variants[incumbent_name][1],
+                variants["laplace_context_tree"][1],
+            )
+            context_tree_comparison.update(comparison)
+            context_tree_comparison["selected"] = context_tree_selected
+            context_tree_comparison["incumbent_representation"] = incumbent_name
+            context_tree_comparison["reason"] = (
+                None
+                if context_tree_selected
+                else (
+                    "context_tree_future_gate_rejected"
+                    if not comparison["candidate_selected_against_raw"]
+                    else "context_tree_incremental_gate_rejected"
+                )
+            )
+            context_tree_comparison["incumbent_candidate_score"] = float(
+                variants[incumbent_name][1]["candidate_score"]
+            )
+            context_tree_comparison["context_tree_candidate_score"] = float(
+                variants["laplace_context_tree"][1]["candidate_score"]
+            )
+            if context_tree_selected:
+                chosen_name = "laplace_context_tree"
+        temporal, chosen_decision = variants[chosen_name]
+        decision = dict(chosen_decision)
         selected = bool(decision.pop("selected"))
         metric = str(decision.pop("metric"))
         reason = None if selected else self._rejection_reason(decision)
+        context_state_report = temporal.report_["context_state"]
+        context_tree_report = temporal.report_["context_tree"]
+        if not isinstance(context_state_report, dict) or not isinstance(context_tree_report, dict):
+            raise RuntimeError("temporal report is missing context feature declarations")
         return gate_report(
             "temporal_laplace_evidence",
             selected,
@@ -834,6 +1045,15 @@ class TemporalEvidenceChallenger:
             features=int(len(temporal.feature_names_)),
             scales_seconds=[float(scale) for scale in temporal.scales_seconds_],
             channels=[str(channel) for channel in temporal.channel_names_],
+            selected_representation=chosen_name if selected else "raw",
+            context_state_considered=consider_context,
+            context_state_selected=chosen_name != "laplace",
+            context_state_features=int(context_state_report["features"]),
+            context_state_comparison=context_comparison,
+            context_tree_considered=consider_context_tree,
+            context_tree_selected=chosen_name == "laplace_context_tree",
+            context_tree_features=int(context_tree_report["features"]),
+            context_tree_comparison=context_tree_comparison,
             **decision,
         )
 

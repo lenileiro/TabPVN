@@ -14,6 +14,7 @@ from tabpvn.proposers.posterior import (
     CategoricalPosteriorChallenger,
     NumericIntervalPosteriorChallenger,
 )
+from tabpvn.proposers.routing import BayesianExpertRouter
 from tabpvn.proposers.temporal import TemporalEvidenceChallenger
 
 __all__ = [
@@ -28,5 +29,6 @@ __all__ = [
     "ClassificationEvidenceWorkspace",
     "CategoricalPosteriorChallenger",
     "NumericIntervalPosteriorChallenger",
+    "BayesianExpertRouter",
     "TemporalEvidenceChallenger",
 ]
