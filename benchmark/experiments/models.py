@@ -192,7 +192,7 @@ def _tabpvn(task: str):
 def _tabpvn_legacy_allocation(task: str):
     """Research ablation: pre-verifier absolute top-half search allocation."""
     from tabpvn import TabPVN
-    from tabpvn.candidate_allocation import AllocationDecision, score_values
+    from tabpvn.candidate_allocation import AllocationDecision, FinalistDecision, score_values
 
     class _LegacyAllocation(TabPVN):
         def _allocate_search_budget(
@@ -226,7 +226,56 @@ def _tabpvn_legacy_allocation(task: str):
                 },
             )
 
+        def _select_search_finalist(self, scores, candidates, baseline_index, *, maximize):
+            ranked = sorted(
+                candidates,
+                key=lambda index: score_values(scores[index]),
+                reverse=maximize,
+            )
+            return FinalistDecision(
+                ranked[0],
+                {
+                    "stage": "finalist_selection",
+                    "method": "legacy_absolute_finalist",
+                    "evaluated_candidates": int(len(candidates)),
+                    "absolute_leader": int(ranked[0]),
+                    "selected_candidate": int(ranked[0]),
+                    "selection_changed": False,
+                    "baseline_candidate": int(baseline_index),
+                },
+            )
+
     return _LegacyAllocation(seed=0, task=task)
+
+
+def _tabpvn_independent_linear_gate(task: str):
+    """Research ablation: refit both sides of the post-tuning linear-leaf gate."""
+    from tabpvn import TabPVN
+
+    class _IndependentLinearGate(TabPVN):
+        _reuse_tuning_linear_leaf_evidence = False
+
+    return _IndependentLinearGate(seed=0, task=task)
+
+
+def _tabpvn_coarse_memory_blends(task: str):
+    """Research ablation: retain the original five-point memory blend grid."""
+    from tabpvn import TabPVN
+
+    class _CoarseMemoryBlends(TabPVN):
+        _memory_blend_weights = (0.1, 0.2, 0.3, 0.4, 0.5)
+
+    return _CoarseMemoryBlends(seed=0, task=task)
+
+
+def _tabpvn_strict_target_encoding(task: str):
+    """Research ablation: require the legacy fixed 0.003 AUC gain."""
+    from tabpvn import TabPVN
+
+    class _StrictTargetEncoding(TabPVN):
+        _target_encoding_proper_score_support = False
+
+    return _StrictTargetEncoding(seed=0, task=task)
 
 
 def _tabpvn_base(task: str):
@@ -311,6 +360,20 @@ def _tabpvn_adaptive_hard_pair(task: str):
     return _tabpvn(task)
 
 
+def _tabpvn_ungated_adaptive_hard_pair(task: str):
+    """Research ablation: retain residual routing but skip proper-score stage selection."""
+    from tabpvn import TabPVN
+
+    class _UngatedAdaptiveHardPair(TabPVN):
+        def _with_adaptive_multiclass_pair_growth(self, X, y, config):
+            selected = super()._with_adaptive_multiclass_pair_growth(X, y, config)
+            if selected.get("adaptive_best_first_pair", False):
+                selected["verifier_gated_pair_growth"] = False
+            return selected
+
+    return _UngatedAdaptiveHardPair(seed=0, task=task)
+
+
 def _tabpvn_no_adaptive_hard_pair(task: str):
     """Research ablation: disable verifier-triggered multiclass pair capacity."""
     from tabpvn import TabPVN
@@ -366,6 +429,96 @@ def _tabpvn_no_threshold_rules(task: str):
     return _NoThresholdRules(seed=0, task=task)
 
 
+def _tabpvn_no_mdl_symbolic_beam(task: str):
+    """Research ablation: retain finite predicates but disable MDL beam expansion."""
+    from tabpvn import TabPVN
+
+    class _NoMDLSymbolicBeam(TabPVN):
+        _symbolic_mdl_beam = False
+
+    return _NoMDLSymbolicBeam(seed=0, task=task)
+
+
+def _tabpvn_no_mdl_dnf(task: str):
+    """Research ablation: retain signed conjunction search but disable DNF composition."""
+    from tabpvn import TabPVN
+
+    class _NoMDLDNF(TabPVN):
+        _symbolic_mdl_dnf = False
+
+    return _NoMDLDNF(seed=0, task=task)
+
+
+def _tabpvn_no_mdl_recursive_dnf(task: str):
+    """Research ablation: retain pair DNF but disable the third recursive branch."""
+    from tabpvn import TabPVN
+
+    class _NoMDLRecursiveDNF(TabPVN):
+        _symbolic_mdl_recursive_dnf = False
+
+    return _NoMDLRecursiveDNF(seed=0, task=task)
+
+
+def _tabpvn_no_mdl_exception(task: str):
+    """Research ablation: retain recursive DNF but disable set-difference programs."""
+    from tabpvn import TabPVN
+
+    class _NoMDLException(TabPVN):
+        _symbolic_mdl_exception = False
+
+    return _NoMDLException(seed=0, task=task)
+
+
+def _tabpvn_no_bayesian_expert_router(task: str):
+    """Research ablation: retain memory experts but apply one global blend."""
+    from tabpvn import TabPVN
+
+    class _NoBayesianExpertRouter(TabPVN):
+        _bayesian_expert_routing = False
+
+    return _NoBayesianExpertRouter(seed=0, task=task)
+
+
+def _tabpvn_no_hierarchical_path_memory(task: str):
+    """Research ablation: retain the incumbent local proof-path vote only."""
+    from tabpvn import TabPVN
+
+    class _NoHierarchicalPathMemory(TabPVN):
+        _hierarchical_proof_path_memory = False
+
+    return _NoHierarchicalPathMemory(seed=0, task=task)
+
+
+def _tabpvn_no_temporal_context_state(task: str):
+    """Research ablation: retain Laplace histories but disable exact depth-two context."""
+    from tabpvn import TabPVN
+
+    class _NoTemporalContextState(TabPVN):
+        _temporal_context_state = False
+
+    return _NoTemporalContextState(seed=0, task=task)
+
+
+def _tabpvn_no_temporal_suffix_tree(task: str):
+    """Research ablation: retain fixed context but disable variable-order suffix state."""
+    from tabpvn import TabPVN
+
+    class _NoTemporalSuffixTree(TabPVN):
+        _temporal_context_tree = False
+
+    return _NoTemporalSuffixTree(seed=0, task=task)
+
+
+def _tabpvn_no_categorical_hypergraph(task: str):
+    """Research ablation: retain single/pair posteriors but disable categorical hyperedges."""
+    from tabpvn import TabPVN
+
+    class _NoCategoricalHypergraph(TabPVN):
+        _categorical_hypergraph_posterior = False
+
+    return _NoCategoricalHypergraph(seed=0, task=task)
+
+
 def _tabpvn_no_rare_architecture(task: str):
     """Research ablation: disable AP checkpointing and rare symbolic programs."""
     from tabpvn import TabPVN
@@ -397,17 +550,30 @@ REGISTRY: dict[str, Factory] = {
     "tabpfn": _tabpfn,
     "tabpvn": _tabpvn,
     "tabpvn_legacy_allocation": _tabpvn_legacy_allocation,
+    "tabpvn_independent_linear_gate": _tabpvn_independent_linear_gate,
+    "tabpvn_coarse_memory_blends": _tabpvn_coarse_memory_blends,
+    "tabpvn_strict_target_encoding": _tabpvn_strict_target_encoding,
     "tabpvn_base": _tabpvn_base,
     "tabpvn_freq": _tabpvn_frequency_only,
     "tabpvn_shared": _tabpvn_shared_multiclass,
     "tabpvn_best_first_multiclass": _tabpvn_best_first_multiclass,
     "tabpvn_hard_pair_best_first": _tabpvn_hard_pair_best_first,
     "tabpvn_adaptive_hard_pair": _tabpvn_adaptive_hard_pair,
+    "tabpvn_ungated_adaptive_hard_pair": _tabpvn_ungated_adaptive_hard_pair,
     "tabpvn_no_adaptive_hard_pair": _tabpvn_no_adaptive_hard_pair,
     "tabpvn_unstratified_multiclass": _tabpvn_unstratified_multiclass,
     "tabpvn_depth4_affine_auc": _tabpvn_depth4_affine_auc,
     "tabpvn_threshold_rules": _tabpvn_threshold_rules,
     "tabpvn_no_threshold_rules": _tabpvn_no_threshold_rules,
+    "tabpvn_no_mdl_symbolic_beam": _tabpvn_no_mdl_symbolic_beam,
+    "tabpvn_no_mdl_dnf": _tabpvn_no_mdl_dnf,
+    "tabpvn_no_mdl_recursive_dnf": _tabpvn_no_mdl_recursive_dnf,
+    "tabpvn_no_mdl_exception": _tabpvn_no_mdl_exception,
+    "tabpvn_no_bayesian_expert_router": _tabpvn_no_bayesian_expert_router,
+    "tabpvn_no_hierarchical_path_memory": _tabpvn_no_hierarchical_path_memory,
+    "tabpvn_no_temporal_context_state": _tabpvn_no_temporal_context_state,
+    "tabpvn_no_temporal_suffix_tree": _tabpvn_no_temporal_suffix_tree,
+    "tabpvn_no_categorical_hypergraph": _tabpvn_no_categorical_hypergraph,
     "tabpvn_no_rare_architecture": _tabpvn_no_rare_architecture,
     "tabpvn_no_affine_rank": _tabpvn_no_affine_rank,
 }
