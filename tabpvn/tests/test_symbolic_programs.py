@@ -1,5 +1,7 @@
 """Deterministic predicate compiler integration tests."""
 
+import pickle
+
 import numpy as np
 import pandas as pd
 
@@ -107,6 +109,300 @@ def test_symbolic_compiler_replays_three_literal_threshold_clause():
 
     assert np.array_equal(derived, y)
     assert mapper.names()[mapper.predicates.index(clause)].count(" AND ") == 2
+
+
+def test_mdl_beam_discovers_signed_higher_order_program():
+    rng = np.random.default_rng(777)
+    X = rng.integers(0, 2, size=(2_000, 10)).astype(float)
+    y = ((X[:, 0] > 0.5) & (X[:, 1] <= 0.5) & (X[:, 2] > 0.5) & (X[:, 3] <= 0.5)).astype(int)
+
+    mapper = SymbolicPredicateMap(seed=3).fit(X, y)
+    predicate = next(
+        predicate
+        for predicate in mapper.predicates
+        if predicate.kind == "binary_and"
+        and predicate.columns == (0, 1, 2, 3)
+        and predicate.directions == (True, False, True, False)
+    )
+    derived = mapper.transform(X)[:, X.shape[1] + mapper.predicates.index(predicate)]
+    report = next(row for row in mapper.mdl_program_report_ if row["predicate"] == predicate)
+
+    np.testing.assert_array_equal(derived, y)
+    assert report["codelength_saved_bits"] > report["description_bits"]
+    assert report["net_mdl_bits"] >= mapper.MDL_MIN_NET_BITS
+    assert mapper.names()[mapper.predicates.index(predicate)] == (
+        "feature[0] AND NOT feature[1] AND feature[2] AND NOT feature[3]"
+    )
+
+
+def test_mdl_beam_discovers_canonical_two_branch_dnf_program():
+    rng = np.random.default_rng(2041)
+    X = rng.integers(0, 2, size=(4_000, 10)).astype(float)
+    y = (((X[:, 0] > 0.5) & (X[:, 1] <= 0.5)) | ((X[:, 2] > 0.5) & (X[:, 3] > 0.5))).astype(int)
+
+    mapper = SymbolicPredicateMap(seed=9).fit(X, y)
+    predicate = next(
+        predicate
+        for predicate in mapper.predicates
+        if predicate.kind == "binary_dnf"
+        and predicate.columns == (0, 1, 2, 3)
+        and predicate.value == 2
+        and predicate.directions == (True, False, True, True)
+    )
+    derived = mapper.transform(X)[:, X.shape[1] + mapper.predicates.index(predicate)]
+    report = next(row for row in mapper.mdl_program_report_ if row["predicate"] == predicate)
+
+    np.testing.assert_array_equal(derived, y)
+    assert report["program_kind"] == "binary_dnf"
+    assert report["branch_count"] == 2
+    assert report["codelength_saved_bits"] > report["description_bits"]
+    assert mapper.mdl_dnf_candidates_evaluated_ > 0
+    assert mapper.names()[mapper.predicates.index(predicate)] == (
+        "(feature[0] AND NOT feature[1]) OR (feature[2] AND feature[3])"
+    )
+
+
+def test_mdl_beam_recursively_grows_an_exact_three_branch_program():
+    rng = np.random.default_rng(3031)
+    X = rng.integers(0, 2, size=(4_000, 12)).astype(float)
+    y = (
+        ((X[:, 0] > 0.5) & (X[:, 1] <= 0.5))
+        | ((X[:, 2] > 0.5) & (X[:, 3] > 0.5))
+        | ((X[:, 4] <= 0.5) & (X[:, 5] > 0.5))
+    ).astype(int)
+
+    mapper = SymbolicPredicateMap(seed=0).fit(X, y)
+    predicate = next(
+        predicate
+        for predicate in mapper.predicates
+        if predicate.kind == "binary_recursive_dnf"
+        and predicate.columns == (0, 1, 2, 3, 4, 5)
+        and predicate.directions == (True, False, True, True, False, True)
+    )
+    derived = mapper.transform(X)[:, X.shape[1] + mapper.predicates.index(predicate)]
+    restored = pickle.loads(pickle.dumps(mapper))
+    report = next(row for row in mapper.mdl_program_report_ if row["predicate"] == predicate)
+
+    np.testing.assert_array_equal(derived, y)
+    np.testing.assert_array_equal(restored.transform(X), mapper.transform(X))
+    assert predicate.value == 3
+    assert predicate.branch_widths == (2, 2, 2)
+    assert report["program_kind"] == "binary_recursive_dnf"
+    assert report["branch_count"] == 3
+    assert report["codelength_saved_bits"] > report["description_bits"]
+    assert mapper.mdl_recursive_dnf_candidates_evaluated_ > 0
+    assert mapper.names()[mapper.predicates.index(predicate)] == (
+        "(feature[0] AND NOT feature[1]) OR (feature[2] AND feature[3]) OR "
+        "(NOT feature[4] AND feature[5])"
+    )
+
+
+def test_mdl_search_compiles_exact_counterexample_guided_exception_program():
+    rng = np.random.default_rng(5051)
+    X = rng.integers(0, 2, size=(4_000, 12)).astype(float)
+    y = (
+        (X[:, 0] > 0.5)
+        & ~(
+            ((X[:, 1] > 0.5) & (X[:, 2] > 0.5))
+            | ((X[:, 3] > 0.5) & (X[:, 4] > 0.5))
+        )
+    ).astype(int)
+
+    mapper = SymbolicPredicateMap(seed=0).fit(X, y)
+    predicate = next(
+        predicate
+        for predicate in mapper.predicates
+        if predicate.kind == "binary_exception"
+        and predicate.columns == (0, 1, 2, 3, 4)
+        and predicate.directions == (True, True, True, True, True)
+    )
+    derived = mapper.transform(X)[:, X.shape[1] + mapper.predicates.index(predicate)]
+    restored = pickle.loads(pickle.dumps(mapper))
+    report = next(row for row in mapper.mdl_program_report_ if row["predicate"] == predicate)
+
+    np.testing.assert_array_equal(derived, y)
+    np.testing.assert_array_equal(restored.transform(X), mapper.transform(X))
+    assert predicate.value == 2
+    assert predicate.branch_widths == (1, 2, 2)
+    assert report["program_kind"] == "binary_exception"
+    assert report["exception_count"] == 2
+    assert report["codelength_saved_bits"] > report["description_bits"]
+    assert mapper.mdl_exception_clause_candidates_evaluated_ > 0
+    assert mapper.mdl_exception_candidates_evaluated_ > 0
+    assert mapper.names()[mapper.predicates.index(predicate)] == (
+        "(feature[0]) AND NOT ((feature[1] AND feature[2]) OR "
+        "(feature[3] AND feature[4]))"
+    )
+
+
+def test_mdl_beam_rejects_random_programs_after_description_cost():
+    rng = np.random.default_rng(778)
+    X = rng.integers(0, 2, size=(2_000, 12)).astype(float)
+    y = rng.integers(0, 2, size=len(X))
+
+    mapper = SymbolicPredicateMap(seed=4).fit(X, y)
+
+    assert mapper.mdl_candidates_evaluated_ > 0
+    assert mapper.mdl_predicates_selected_ == 0
+    assert not any(
+        predicate.kind
+        in {"binary_and", "binary_dnf", "binary_recursive_dnf", "binary_exception"}
+        for predicate in mapper.predicates
+    )
+    assert mapper.mdl_recursive_dnf_predicates_selected_ == 0
+    assert mapper.mdl_exception_predicates_selected_ == 0
+
+
+def test_mdl_beam_compresses_certified_booster_residuals():
+    rng = np.random.default_rng(781)
+    X = rng.integers(0, 2, size=(4_000, 10)).astype(float)
+    correction = (X[:, 0] > 0.5) & (X[:, 1] <= 0.5) & (X[:, 2] > 0.5) & (X[:, 3] <= 0.5)
+    baseline_label = X[:, 4] > 0.5
+    y = np.logical_xor(correction, baseline_label).astype(int)
+    baseline_probability = np.where(baseline_label, 0.95, 0.05)
+
+    mapper = SymbolicPredicateMap(seed=3).fit(
+        X,
+        y,
+        mdl_baseline_probability=baseline_probability,
+    )
+    exact_branches = [
+        predicate
+        for predicate in mapper.predicates
+        if predicate.kind == "binary_and"
+        and predicate.columns == (0, 1, 2, 3, 4)
+        and predicate.directions[:4] == (True, False, True, False)
+    ]
+
+    assert {predicate.directions[-1] for predicate in exact_branches} == {False, True}
+    assert mapper.mdl_search_objective_ == "certified_booster_residual_laplace_codelength"
+    assert mapper.mdl_source_evidence_rows_ == len(X)
+    assert mapper.mdl_evidence_rows_ == mapper.MDL_MAX_EVIDENCE_ROWS
+    assert mapper.mdl_evidence_capped_ is True
+    assert all(row["net_mdl_bits"] > 0.0 for row in mapper.mdl_program_report_)
+
+
+def test_cross_fitted_gate_admits_mdl_program_only_after_untouched_fold_lift():
+    rng = np.random.default_rng(934)
+    X = rng.integers(0, 2, size=(2_400, 10)).astype(float)
+    correction = (X[:, 0] > 0.5) & (X[:, 1] <= 0.5) & (X[:, 2] > 0.5) & (X[:, 3] <= 0.5)
+    y = np.logical_xor(correction, X[:, 4] > 0.5).astype(int)
+    model = TabPVN(seed=0)
+
+    mapper = model._auto_interactions(
+        X,
+        y,
+        {"rounds": 60, "depth": 1, "leaf": 10, "lr": 0.05},
+    )
+
+    report = {entry["name"]: entry for entry in model.candidate_report_}
+    exact_branches = [
+        predicate
+        for predicate in mapper.predicates
+        if predicate.kind == "binary_and"
+        and predicate.columns == (0, 1, 2, 3, 4)
+        and predicate.directions[:4] == (True, False, True, False)
+    ]
+    assert report["symbolic_predicate_boost"]["selected"] is True
+    assert min(report["symbolic_predicate_boost"]["fold_auc_delta"]) > 0.05
+    assert {predicate.directions[-1] for predicate in exact_branches} == {False, True}
+
+
+def test_dnf_program_lifts_a_capacity_bounded_certified_booster():
+    rng = np.random.default_rng(2050)
+    X = rng.integers(0, 2, size=(3_000, 12)).astype(float)
+    y = (
+        ((X[:, 0] > 0.5) & (X[:, 1] <= 0.5) & (X[:, 2] > 0.5))
+        | ((X[:, 3] > 0.5) & (X[:, 4] > 0.5) & (X[:, 5] <= 0.5))
+    ).astype(int)
+    config = {"rounds": 1, "depth": 1, "leaf": 10, "lr": 0.1, "patience": 2}
+    default = TabPVN(seed=0)
+    ablation = TabPVN(seed=0)
+    ablation._symbolic_mdl_dnf = False
+
+    mapper = default._auto_interactions(X, y, config)
+    ablation_mapper = ablation._auto_interactions(X, y, config)
+    report = {entry["name"]: entry for entry in default.candidate_report_}["symbolic_predicate_boost"]
+    ablation_report = {entry["name"]: entry for entry in ablation.candidate_report_}[
+        "symbolic_predicate_boost"
+    ]
+
+    assert mapper is not None and ablation_mapper is not None
+    assert any(predicate.kind == "binary_dnf" for predicate in mapper.predicates)
+    assert not any(predicate.kind == "binary_dnf" for predicate in ablation_mapper.predicates)
+    assert min(report["fold_auc_delta"]) > 0.35
+    assert np.mean(report["fold_auc_delta"]) > np.mean(ablation_report["fold_auc_delta"]) + 0.2
+
+
+def test_recursive_dnf_gate_adds_only_consistent_incremental_lift():
+    rng = np.random.default_rng(3031)
+    rows = 2_400
+    group = rng.integers(0, 4, size=rows)
+    routes = np.column_stack([group == index for index in range(4)]).astype(float)
+    bits = rng.integers(0, 2, size=(rows, 4)).astype(float)
+    noise = rng.integers(0, 2, size=(rows, 4)).astype(float)
+    X = np.column_stack([routes, bits, noise])
+    y = (
+        (routes[:, 0].astype(bool) & bits[:, 0].astype(bool))
+        | (routes[:, 1].astype(bool) & bits[:, 1].astype(bool))
+        | (routes[:, 2].astype(bool) & bits[:, 2].astype(bool))
+    ).astype(int)
+    config = {"rounds": 1, "depth": 1, "leaf": 10, "lr": 0.1, "patience": 2}
+    default = TabPVN(seed=0)
+    ablation = TabPVN(seed=0)
+    ablation._symbolic_mdl_recursive_dnf = False
+
+    mapper = default._auto_interactions(X, y, config)
+    ablation_mapper = ablation._auto_interactions(X, y, config)
+    report = {entry["name"]: entry for entry in default.candidate_report_}
+    ablation_report = {entry["name"]: entry for entry in ablation.candidate_report_}
+
+    assert mapper is not None and ablation_mapper is not None
+    assert any(predicate.kind == "binary_recursive_dnf" for predicate in mapper.predicates)
+    assert not any(
+        predicate.kind == "binary_recursive_dnf" for predicate in ablation_mapper.predicates
+    )
+    assert report["mdl_recursive_dnf"]["selected"] is True
+    assert min(report["mdl_recursive_dnf"]["fold_auc_delta"]) > 0.1
+    assert report["symbolic_predicate_boost"]["mean_auc"] == 1.0
+    assert (
+        np.mean(report["symbolic_predicate_boost"]["fold_auc_delta"])
+        > np.mean(ablation_report["symbolic_predicate_boost"]["fold_auc_delta"]) + 0.1
+    )
+
+
+def test_exception_program_gate_adds_only_consistent_incremental_lift():
+    rng = np.random.default_rng(5053)
+    X = rng.integers(0, 2, size=(2_400, 12)).astype(float)
+    y = (
+        (X[:, 0] > 0.5)
+        & ~(
+            ((X[:, 1] > 0.5) & (X[:, 2] > 0.5))
+            | ((X[:, 3] > 0.5) & (X[:, 4] > 0.5))
+        )
+    ).astype(int)
+    config = {"rounds": 1, "depth": 1, "leaf": 10, "lr": 0.1, "patience": 2}
+    default = TabPVN(seed=0)
+    ablation = TabPVN(seed=0)
+    ablation._symbolic_mdl_exception = False
+
+    mapper = default._auto_interactions(X, y, config)
+    ablation_mapper = ablation._auto_interactions(X, y, config)
+    report = {entry["name"]: entry for entry in default.candidate_report_}
+    ablation_report = {entry["name"]: entry for entry in ablation.candidate_report_}
+
+    assert mapper is not None and ablation_mapper is not None
+    assert any(predicate.kind == "binary_exception" for predicate in mapper.predicates)
+    assert not any(
+        predicate.kind == "binary_exception" for predicate in ablation_mapper.predicates
+    )
+    assert report["mdl_exception_program"]["selected"] is True
+    assert min(report["mdl_exception_program"]["fold_auc_delta"]) > 0.06
+    assert report["symbolic_predicate_boost"]["mean_auc"] == 1.0
+    assert (
+        np.mean(report["symbolic_predicate_boost"]["fold_auc_delta"])
+        > np.mean(ablation_report["symbolic_predicate_boost"]["fold_auc_delta"]) + 0.06
+    )
 
 
 def test_residual_compiler_prioritizes_the_boosters_missing_cardinality_concept():
@@ -541,6 +837,112 @@ def test_selected_symbolic_program_is_replayed_by_prediction_and_certificate(mon
 
     assert model.interaction_features_ == ["feature[0]=1 AND feature[1]=1"]
     assert model._X(X).shape[1] == 3
+    assert np.array_equal(model.predict(X), y)
+    assert model.certify(X[:20]) == 1.0
+
+
+def test_signed_mdl_program_is_replayed_by_prediction_and_certificate(monkeypatch):
+    rng = np.random.default_rng(779)
+    X = rng.integers(0, 2, size=(320, 4)).astype(float)
+    y = ((X[:, 0] > 0.5) & (X[:, 1] <= 0.5) & (X[:, 2] > 0.5)).astype(int)
+    mapper = SymbolicPredicateMap(seed=0)
+    mapper.predicates = [
+        Predicate(
+            "binary_and",
+            (0, 1, 2),
+            1,
+            directions=(True, False, True),
+        )
+    ]
+    monkeypatch.setattr(TabPVN, "_auto_interactions", lambda _self, _X, _y, _boost: mapper)
+
+    model = TabPVN(seed=0).fit(X, y)
+
+    assert model.interaction_features_ == ["feature[0] AND NOT feature[1] AND feature[2]"]
+    assert np.array_equal(model.predict(X), y)
+    assert model.certify(X[:20]) == 1.0
+
+
+def test_dnf_program_is_replayed_by_prediction_and_certificate(monkeypatch):
+    rng = np.random.default_rng(2060)
+    X = rng.integers(0, 2, size=(320, 4)).astype(float)
+    y = (((X[:, 0] > 0.5) & (X[:, 1] <= 0.5)) | ((X[:, 2] > 0.5) & (X[:, 3] > 0.5))).astype(int)
+    mapper = SymbolicPredicateMap(seed=0)
+    mapper.predicates = [
+        Predicate(
+            "binary_dnf",
+            (0, 1, 2, 3),
+            2,
+            directions=(True, False, True, True),
+        )
+    ]
+    monkeypatch.setattr(TabPVN, "_auto_interactions", lambda _self, _X, _y, _boost: mapper)
+
+    model = TabPVN(seed=0).fit(X, y)
+
+    assert model.interaction_features_ == ["(feature[0] AND NOT feature[1]) OR (feature[2] AND feature[3])"]
+    assert np.array_equal(model.predict(X), y)
+    assert model.certify(X[:20]) == 1.0
+
+
+def test_recursive_dnf_program_is_replayed_by_prediction_and_certificate(monkeypatch):
+    rng = np.random.default_rng(3060)
+    X = rng.integers(0, 2, size=(400, 6)).astype(float)
+    y = (
+        ((X[:, 0] > 0.5) & (X[:, 1] <= 0.5))
+        | ((X[:, 2] > 0.5) & (X[:, 3] > 0.5))
+        | ((X[:, 4] <= 0.5) & (X[:, 5] > 0.5))
+    ).astype(int)
+    mapper = SymbolicPredicateMap(seed=0)
+    mapper.predicates = [
+        Predicate(
+            "binary_recursive_dnf",
+            (0, 1, 2, 3, 4, 5),
+            3,
+            directions=(True, False, True, True, False, True),
+            branch_widths=(2, 2, 2),
+        )
+    ]
+    monkeypatch.setattr(TabPVN, "_auto_interactions", lambda _self, _X, _y, _boost: mapper)
+
+    model = TabPVN(seed=0).fit(X, y)
+
+    assert model.interaction_features_ == [
+        "(feature[0] AND NOT feature[1]) OR (feature[2] AND feature[3]) OR "
+        "(NOT feature[4] AND feature[5])"
+    ]
+    assert np.array_equal(model.predict(X), y)
+    assert model.certify(X[:20]) == 1.0
+
+
+def test_exception_program_is_replayed_by_prediction_and_certificate(monkeypatch):
+    rng = np.random.default_rng(5060)
+    X = rng.integers(0, 2, size=(400, 5)).astype(float)
+    y = (
+        (X[:, 0] > 0.5)
+        & ~(
+            ((X[:, 1] > 0.5) & (X[:, 2] > 0.5))
+            | ((X[:, 3] > 0.5) & (X[:, 4] > 0.5))
+        )
+    ).astype(int)
+    mapper = SymbolicPredicateMap(seed=0)
+    mapper.predicates = [
+        Predicate(
+            "binary_exception",
+            (0, 1, 2, 3, 4),
+            2,
+            directions=(True, True, True, True, True),
+            branch_widths=(1, 2, 2),
+        )
+    ]
+    monkeypatch.setattr(TabPVN, "_auto_interactions", lambda _self, _X, _y, _boost: mapper)
+
+    model = TabPVN(seed=0).fit(X, y)
+
+    assert model.interaction_features_ == [
+        "(feature[0]) AND NOT ((feature[1] AND feature[2]) OR "
+        "(feature[3] AND feature[4]))"
+    ]
     assert np.array_equal(model.predict(X), y)
     assert model.certify(X[:20]) == 1.0
 

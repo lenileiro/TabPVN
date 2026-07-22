@@ -17,6 +17,24 @@ def _xor_categories(repeats=60):
     return X, y
 
 
+def _three_way_parity_categories(repeats=60):
+    patterns = np.array(
+        [[first, second, third] for first in range(2) for second in range(2) for third in range(2)]
+    )
+    codes = np.tile(patterns, (repeats, 1))
+    y = (codes[:, 0] ^ codes[:, 1] ^ codes[:, 2]).astype(int)
+    X = np.zeros((len(y), 6), dtype=float)
+    for group in range(3):
+        X[np.arange(len(y)), 2 * group + codes[:, group]] = 1.0
+    groups = ((0, 1), (2, 3), (4, 5))
+    return X, y, groups
+
+
+def _balanced_parity_splits(repeats):
+    fold = np.repeat(np.arange(repeats) % 3, 8)
+    return [(np.flatnonzero(fold != index), np.flatnonzero(fold == index)) for index in range(3)]
+
+
 def _category_model():
     model = TabPVN(seed=0)
     model.mode = "classification"
@@ -118,6 +136,71 @@ def test_dirichlet_category_pair_recovers_interaction_and_verifies_evidence():
 
     tampered = dict(evidence, combined_probability=[0.9, 0.1])
     assert not TabPVN.verify_posterior_evidence(tampered)
+
+
+def test_categorical_hyperedge_recovers_three_way_parity_and_verifies_evidence():
+    X, y, groups = _three_way_parity_categories()
+    pair_only = CategoricalPosteriorChallenger(X, y, [0, 1], groups, _hypergraph=False)
+    hypergraph = CategoricalPosteriorChallenger(
+        X,
+        y,
+        [0, 1],
+        groups,
+        metadata=tuple({"name": name, "levels": ("off", "on")} for name in ("first", "second", "third")),
+        aggregation=CategoricalPosteriorChallenger.HYPER_STRONGEST,
+    )
+    base = np.tile([0.55, 0.45], (len(y), 1))
+
+    pair_probability = pair_only.combine(base, X, weight=1.0)
+    hyper_probability = hypergraph.combine(base, X, weight=1.0)
+
+    assert (pair_probability.argmax(1) == y).mean() == 0.5
+    assert (hyper_probability.argmax(1) == y).mean() == 1.0
+    report = hypergraph.report()
+    assert report["hyperedge_families"] == 1
+    assert report["hyperedge_mdl_gain"]["(0, 1, 2)"] > 0.0
+    assert report["hyperedge_mdl_penalty"]["(0, 1, 2)"] > 0.0
+    assert report["hyperedge_parent_family"]["(0, 1, 2)"] == [0, 1]
+    evidence = hypergraph.evidence(X, 1, base, weight=1.0)
+    assert evidence["aggregation"] == CategoricalPosteriorChallenger.HYPER_STRONGEST
+    assert evidence["family"] == [0, 1, 2]
+    assert len(evidence["parent_factors"]) == 0
+    assert TabPVN.verify_posterior_evidence(evidence)
+    assert TabPVN.check_proof(evidence)
+
+    tampered = copy.deepcopy(evidence)
+    tampered["class_counts"][0] += 1
+    assert not TabPVN.verify_posterior_evidence(tampered)
+
+    mislabeled = copy.deepcopy(evidence)
+    mislabeled["aggregation"] = "strongest"
+    assert not TabPVN.verify_posterior_evidence(mislabeled)
+
+
+def test_posterior_gate_selects_hypergraph_only_for_transferable_three_way_signal():
+    repeats = 60
+    X, y, groups = _three_way_parity_categories(repeats)
+    base = np.tile([0.55, 0.45], (len(y), 1))
+    precomputed = {"scores": np.log(base), "splits": _balanced_parity_splits(repeats)}
+
+    model = _category_model()
+    model._prep.cat_cols = ["first", "second", "third"]
+    model._prep.onehot = {name: ["off", "on"] for name in model._prep.cat_cols}
+    weight = model._category_posterior_gate(X, y, precomputed)
+
+    ablation = _category_model()
+    ablation._prep.cat_cols = ["first", "second", "third"]
+    ablation._prep.onehot = {name: ["off", "on"] for name in ablation._prep.cat_cols}
+    ablation._categorical_hypergraph_posterior = False
+    ablation_weight = ablation._category_posterior_gate(X, y, precomputed)
+
+    assert groups == ((0, 1), (2, 3), (4, 5))
+    assert weight == 1.0
+    assert model._category_posterior_permission == "class_change"
+    assert model._category_posterior_aggregation == CategoricalPosteriorChallenger.HYPER_STRONGEST
+    assert (model._category_posterior_oof_proba.argmax(1) == y).mean() == 1.0
+    assert ablation_weight == 0.0
+    assert ablation._category_posterior_permission is None
 
 
 def test_disjoint_posterior_pool_combines_multiple_facts_and_verifies_every_factor():

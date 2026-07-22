@@ -15,12 +15,30 @@ from tabpvn.trees import (
     _hardest_class_pair,
     _honest_pair_partition,
     _reestimate_numeric_newton_leaves,
+    _select_multiclass_pair_expert,
     _softmax_pair_newton_terms,
     _tree_pred,
     _tree_pred_rows,
     boost_softmax_predict,
     reason_boost_softmax,
 )
+
+
+def test_pair_expert_gate_requires_a_proper_score_gain():
+    target = np.resize(np.arange(3), 90)
+    baseline = np.zeros((len(target), 3))
+    better = baseline.copy()
+    better[np.arange(len(target)), target] = 1.0
+    worse = -better
+
+    selected, better_report = _select_multiclass_pair_expert(baseline, better, target)
+    rejected, worse_report = _select_multiclass_pair_expert(baseline, worse, target)
+
+    assert selected is True
+    assert better_report["proper_score_delta"] > 0.0
+    assert better_report["rank_score_delta"] >= 0.0
+    assert rejected is False
+    assert worse_report["reason"] == "proper_score_not_improved"
 
 
 def test_hardest_class_pair_balances_each_class_and_breaks_ties_stably():
@@ -144,6 +162,63 @@ def test_adaptive_pair_monitor_has_bounded_inactive_probe(monkeypatch, activate)
     assert len(trace["pair_growth_schedule"]) == 24
     assert len(calls) == (24 if activate else trees._ADAPTIVE_PAIR_PROBE_ROUNDS)
     assert trace["dynamics_monitored_rounds"] == len(calls)
+
+
+@pytest.mark.parametrize("expert_selected", [False, True])
+def test_verifier_gate_retains_only_selected_pair_stages(monkeypatch, expert_selected):
+    rng = np.random.default_rng(911)
+    X = rng.normal(size=(480, 7))
+    y = np.argmax(
+        np.column_stack(
+            [
+                X[:, 0] - 0.4 * X[:, 1],
+                X[:, 1] + X[:, 2] * X[:, 3],
+                -X[:, 0] - X[:, 2] * X[:, 3],
+            ]
+        ),
+        axis=1,
+    )
+
+    class Tracker:
+        def __init__(self, *_args, **_kwargs):
+            self.records = []
+
+        def observe(self, *_args, **_kwargs):
+            return (0, 1)
+
+    def select_expert(*_args, **_kwargs):
+        return expert_selected, {
+            "selected": expert_selected,
+            "reason": "test_selection" if expert_selected else "test_rejection",
+            "proper_score_delta": 0.01 if expert_selected else -0.01,
+            "rank_score_delta": 0.01 if expert_selected else -0.01,
+        }
+
+    monkeypatch.setattr(trees, "ResidualDynamicsTracker", Tracker)
+    monkeypatch.setattr(trees, "_select_multiclass_pair_expert", select_expert)
+    model = AdditiveCertifiedClassifier(
+        rounds=8,
+        lr=0.05,
+        depth=3,
+        leaf=10,
+        patience=12,
+        refit=False,
+        max_leaves=8,
+        best_first_pair=True,
+        adaptive_best_first_pair=True,
+        verifier_gated_pair_growth=True,
+        seed=21,
+    ).fit(X, y)
+
+    assert any(model.attempted_pair_growth_schedule_)
+    assert model.pair_expert_decisions_
+    audition = [row for row in model.pair_expert_decisions_ if row["phase"] == "audition"]
+    assert len(audition) == trees._PAIR_EXPERT_AUDITION_ROUNDS
+    assert all(row["selected"] is True for row in audition)
+    routed = [row for row in model.pair_expert_decisions_ if row["phase"] != "audition"]
+    assert routed
+    assert all(row["selected"] is expert_selected for row in routed)
+    assert model.kernel_certify(X, n_trees=18, sample=30)["scores_reproduced"] == 1.0
 
 
 def test_shared_softmax_tree_uses_one_partition_with_centered_vector_leaves():
@@ -605,6 +680,62 @@ def test_binary_softmax_auc_verifier_is_deterministic_and_keeps_proof_trees():
     for left, right in zip(first[4], second[4], strict=False):
         for left_array, right_array in zip(left, right, strict=False):
             np.testing.assert_array_equal(left_array, right_array)
+
+
+@pytest.mark.parametrize("class_count", [2, 3])
+def test_refit_does_not_expose_early_stop_holdout_as_calibration_evidence(class_count):
+    rng = np.random.default_rng(930 + class_count)
+    X = rng.normal(size=(480, 7))
+    if class_count == 2:
+        y = (X[:, 0] + 0.5 * X[:, 1] * X[:, 2] > 0.0).astype(int)
+    else:
+        y = np.argmax(
+            np.column_stack((X[:, 0], X[:, 1] + 0.4 * X[:, 2], -X[:, 0] - X[:, 1])),
+            axis=1,
+        )
+    common = dict(rounds=24, lr=0.05, depth=4, leaf=12, holdout=0.25, patience=6, seed=19)
+
+    deployed = AdditiveCertifiedClassifier(refit=True, **common).fit(X, y)
+    assert deployed.ver_ is None
+    assert not hasattr(deployed, "_verifier_snapshot")
+
+
+@pytest.mark.parametrize("class_count", [2, 3])
+def test_non_refit_reserves_label_disjoint_calibration_evidence(class_count):
+    rng = np.random.default_rng(960 + class_count)
+    X = rng.normal(size=(1_200, 7))
+    if class_count == 2:
+        y = (X[:, 0] + 0.5 * X[:, 1] * X[:, 2] > 0.0).astype(int)
+    else:
+        y = np.argmax(
+            np.column_stack((X[:, 0], X[:, 1] + 0.4 * X[:, 2], -X[:, 0] - X[:, 1])),
+            axis=1,
+        )
+    model = AdditiveCertifiedClassifier(
+        rounds=24,
+        lr=0.05,
+        depth=4,
+        leaf=12,
+        holdout=0.30,
+        patience=6,
+        seed=23,
+        refit=False,
+        independent_calibration=True,
+        stratified_holdout=True,
+    ).fit(X, y)
+
+    fit_rows, checkpoint_rows, calibration_rows = trees._fit_checkpoint_calibration_split(
+        y,
+        0.30,
+        23,
+        stratified=True,
+        independent_calibration=True,
+    )
+    assert model.verifier_evidence_role_ == "independent_calibration"
+    np.testing.assert_array_equal(model.ver_, calibration_rows)
+    assert set(fit_rows).isdisjoint(checkpoint_rows)
+    assert set(fit_rows).isdisjoint(calibration_rows)
+    assert set(checkpoint_rows).isdisjoint(calibration_rows)
 
 
 def test_indexed_numeric_tree_routing_matches_a_dense_row_slice():

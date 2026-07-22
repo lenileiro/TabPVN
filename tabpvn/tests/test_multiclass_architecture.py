@@ -85,9 +85,15 @@ def test_encoded_categorical_multiclass_fit_enables_numeric_pair_growth(monkeypa
         row for row in model.booster_selection_report_ if row["name"] == "adaptive_multiclass_pair_growth"
     )
     assert model.boost_["adaptive_best_first_pair"] is True
+    assert model.boost_["verifier_gated_pair_growth"] is True
     assert "coupled_pair_growth" not in model.boost_
     assert pair_report["controller_enabled"] is True
-    assert pair_report["reason"] in {"verified_residual_pair", "no_verified_residual_pair"}
+    assert pair_report["verifier_gate_enabled"] is True
+    assert pair_report["reason"] in {
+        "verified_pair_expert",
+        "pair_expert_rejected",
+        "no_verified_residual_pair",
+    }
 
 
 def test_adaptive_pair_growth_is_bounded_to_supported_multiclass_schemas():
@@ -100,6 +106,7 @@ def test_adaptive_pair_growth_is_bounded_to_supported_multiclass_schemas():
     assert selected["max_leaves"] == 24
     assert selected["best_first_pair"] is True
     assert selected["adaptive_best_first_pair"] is True
+    assert selected["verifier_gated_pair_growth"] is True
     assert "coupled_pair_growth" not in selected
     high_cardinality_y = np.resize(np.arange(8), len(y))
     high_cardinality = model._with_adaptive_multiclass_pair_growth(X, high_cardinality_y, base)

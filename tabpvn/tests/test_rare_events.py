@@ -596,7 +596,7 @@ def test_selected_rare_interval_replays_through_prediction_and_certificate(monke
     assert model.certify(X[:20]) == 1.0
 
 
-def test_deploy_verifier_calibration_consumes_prior_corrected_weights():
+def test_independent_deploy_holdout_calibration_consumes_prior_corrected_weights():
     rng = np.random.default_rng(53)
     X = rng.normal(size=(1_000, 4))
     y = np.array([0] * 800 + [1] * 200)
@@ -605,6 +605,7 @@ def test_deploy_verifier_calibration_consumes_prior_corrected_weights():
         classes_ = [0, 1]
         ver_ = np.arange(len(y))
         ver_weight_ = np.where(y == 0, 0.99, 0.04)
+        verifier_evidence_role_ = "independent_calibration"
 
         def _scores(self, rows):
             return np.column_stack([-rows[:, 0], rows[:, 0]])
@@ -622,5 +623,5 @@ def test_deploy_verifier_calibration_consumes_prior_corrected_weights():
 
     assert model._conf is not None
     assert model._conf.weighted_ is True
-    assert model.rare_event_report_["calibration_source"] == "deploy_verifier"
+    assert model.rare_event_report_["calibration_source"] == "independent_deploy_holdout"
     assert np.isclose(model.rare_event_report_["weighted_calibration_rate"], 0.01)

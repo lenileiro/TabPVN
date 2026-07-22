@@ -17,6 +17,21 @@ def _contains_category_node(tree):
     return tree[0] == "node" and (_contains_category_node(tree[3]) or _contains_category_node(tree[4]))
 
 
+def test_dense_category_top_k_batch_matches_scalar_tie_semantics():
+    rng = np.random.default_rng(13)
+    scores = np.round(rng.normal(size=(17, 41)), 1)
+    scores[0, 0] = -np.inf
+    rows = np.arange(scores.shape[1])
+
+    indices, selected = _CategoricalEvidenceMemory._select_top_k_matrix(scores, 9)
+
+    for row, local in enumerate(scores):
+        expected_indices, expected_scores = _CategoricalEvidenceMemory._select_top_k(rows, local, 9)
+        expected = sorted(zip(expected_indices, expected_scores, strict=True))
+        actual = sorted(zip(indices[row], selected[row], strict=True))
+        assert actual == expected
+
+
 def test_discontiguous_category_partition_is_native_and_kernel_checked():
     # A one-hot stump would need multiple stages for {north, west}; one native
     # category-in-set node expresses the finite partition directly.
@@ -204,7 +219,7 @@ def test_category_memory_gate_selects_pair_information_for_pure_interaction():
     )
     report = model.category_memory_report_[-1]
 
-    assert weight == 0.1
+    assert weight == 0.025
     assert model._category_memory_metric == "rarity_plus_label_information_pairs"
     assert model.category_memory_report_[0]["oof_rank_auc"] == 0.5
     assert report["oof_rank_auc"] == 1.0
@@ -250,6 +265,72 @@ def test_category_memory_gate_selects_information_metric_automatically(monkeypat
 
     weight = model._category_memory_gate(X, y, precomp)
 
-    assert weight == 0.1
+    assert weight == 0.025
     assert model._category_memory_metric == "rarity_plus_label_information"
     assert model.category_memory_report_[-1]["selected"] is True
+
+
+def test_category_memory_gate_selects_cross_fitted_bayesian_routing(monkeypatch):
+    rng = np.random.default_rng(15)
+    rows = np.arange(600)
+    y = rows % 2
+    reliable = rows % 4 < 2
+    base_positive = np.where(
+        reliable,
+        rng.uniform(0.2, 0.8, len(rows)),
+        np.where(y == 1, 0.55, 0.45),
+    )
+    expert_positive = np.where(
+        reliable,
+        np.where(y == 1, 0.9, 0.1),
+        np.where(y == 1, 0.1, 0.9),
+    )
+    raw = pd.DataFrame(
+        {
+            "expert_0": 1.0 - expert_positive,
+            "expert_1": expert_positive,
+            **{
+                f"context_{column}": pd.Categorical(rng.integers(0, 3, len(rows)).astype(str))
+                for column in range(4)
+            },
+        }
+    )
+    prep = _Preprocessor(target_encoding=False, task="classification")
+    X = prep.fit_transform(raw, y)
+
+    class ConditionalMemory:
+        def __init__(self, *_args, metric="rarity", **_kwargs):
+            self.metric = metric
+            self.k = 8
+            self.temp = 1.0
+            self.pair_facts = ()
+
+        def proba(self, query):
+            return np.asarray(query)[:, :2]
+
+    monkeypatch.setattr("tabpvn.base._CategoricalEvidenceMemory", ConditionalMemory)
+    splits = list(StratifiedKFold(3, shuffle=True, random_state=3).split(X, y))
+    precomp = {
+        "scores": np.log(np.column_stack((1.0 - base_positive, base_positive))),
+        "splits": splits,
+    }
+
+    routed = TabPVN(seed=3, task="classification")
+    routed._prep = prep
+    routed._pred = SimpleNamespace(classes_=np.array([0, 1]))
+    routed._category_memory_gate(X, y, precomp)
+    routed_report = routed.category_memory_report_[-1]
+
+    global_only = TabPVN(seed=3, task="classification")
+    global_only._bayesian_expert_routing = False
+    global_only._prep = prep
+    global_only._pred = SimpleNamespace(classes_=np.array([0, 1]))
+    global_only._category_memory_gate(X, y, precomp)
+    global_report = global_only.category_memory_report_[-1]
+
+    assert routed_report["selected"] is True
+    assert routed_report["routing"] == "bayesian_context"
+    assert min(routed_report["fold_auc_delta"]) > 0.1
+    assert routed_report["oof_rank_auc"] > global_report["oof_rank_auc"] + 0.004
+    assert routed._category_memory_router is not None
+    assert routed_report["router"]["enabled_contexts"]

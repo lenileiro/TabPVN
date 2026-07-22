@@ -7,6 +7,7 @@ from tabpvn import TabPVN
 from tabpvn.candidate_allocation import (
     VerifierScore,
     allocate_candidates,
+    select_final_candidate,
     verification_blocks,
 )
 
@@ -43,6 +44,11 @@ def test_group_relative_allocation_retains_absolute_leader_and_stable_challenger
     assert decision.report["absolute_leader_retained"] is True
     assert decision.report["baseline_retained"] is True
     assert decision.report["variance_normalization"] is False
+    assert decision.report["method"] == "correlated_latin_hypercube_lower_tail"
+    scenario = decision.report["scenario_verification"]
+    assert scenario["method"] == "correlated_latin_hypercube"
+    assert scenario["baseline_candidate"] == 1
+    assert scenario["scenario_count"] == 69
 
 
 def test_consistent_dominance_reduces_only_later_rung_allocation():
@@ -156,9 +162,9 @@ def test_successive_halving_records_aggregate_allocation_evidence(monkeypatch):
 
     assert best == 0
     assert 1 in finalists
-    assert len(model.search_allocation_report_) == 1
+    assert len(model.search_allocation_report_) == 2
     report = model.search_allocation_report_[0]
-    assert report["method"] == "paired_group_relative_median"
+    assert report["method"] == "correlated_latin_hypercube_lower_tail"
     assert report["absolute_anchor"] == "certified_baseline"
     assert report["evaluated_candidates"] == 3
     assert report["promoted_candidates"] == 3
@@ -166,4 +172,35 @@ def test_successive_halving_records_aggregate_allocation_evidence(monkeypatch):
     assert report["group_relative_active"] is True
     assert report["baseline_retained"] is True
     assert report["variance_normalization"] is False
+    assert report["scenario_verification"]["role"] == "fit_budget_verifier"
     assert report["budget"] == {"index": 0, "rounds": 10}
+    final = model.search_allocation_report_[1]
+    assert final["stage"] == "finalist_selection"
+    assert final["scenario_verification"]["role"] == "finalist_verifier"
+
+
+def test_finalist_scenarios_prefer_stable_challenger_over_spiky_absolute_leader():
+    scores = {
+        0: VerifierScore((0.76,), (0.99, 0.53, 0.99, 0.53)),
+        1: VerifierScore((0.70,), (0.70, 0.70, 0.70, 0.70)),
+        2: VerifierScore((0.75,), (0.75, 0.75, 0.75, 0.75)),
+    }
+
+    decision = select_final_candidate(scores, [0, 1, 2], 1, maximize=True)
+
+    assert decision.candidate == 2
+    assert decision.report["absolute_leader"] == 0
+    assert decision.report["selection_changed"] is True
+    assert decision.report["deployment_gate"] == "caller_absolute_improvement_and_secondary_safety"
+
+
+def test_finalist_scenarios_fall_back_to_absolute_order_with_small_evidence():
+    scores = {
+        0: VerifierScore((0.80,), (0.80, 0.80, 0.80)),
+        1: VerifierScore((0.79,), (0.79, 0.79, 0.79)),
+    }
+
+    decision = select_final_candidate(scores, [0, 1], 1, maximize=True)
+
+    assert decision.candidate == 0
+    assert decision.report["method"] == "absolute_small_evidence_fallback"

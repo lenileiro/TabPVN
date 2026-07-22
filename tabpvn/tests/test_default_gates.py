@@ -134,6 +134,49 @@ def test_classifier_tuning_reuses_stratified_rung_evidence(monkeypatch):
     np.testing.assert_array_equal(np.unique(validation_y, return_counts=True)[1], [120, 30])
 
 
+def test_classifier_tuning_reuses_final_rung_for_linear_leaf_gate(monkeypatch):
+    fits = []
+
+    class LinearGateStub:
+        def __init__(self, linear_leaf=False):
+            self.linear_leaf = linear_leaf
+
+        def fit(self, _X, y, sample_weight=None):
+            del sample_weight
+            fits.append(self.linear_leaf)
+            self.classes_ = np.unique(y)
+            return self
+
+        def _scores(self, X):
+            scale = 2.0 if self.linear_leaf else 0.2
+            return np.column_stack([np.zeros(len(X)), scale * (2.0 * X[:, 0] - 1.0)])
+
+    model = TabPVN(seed=3)
+    monkeypatch.setattr(
+        model,
+        "_classifier",
+        lambda **kwargs: LinearGateStub(linear_leaf=kwargs.get("linear_leaf", False)),
+    )
+
+    def evaluate_baseline(candidates, base_idx, score_fn, rungs, maximize):
+        assert maximize is True
+        baseline = score_fn(candidates[base_idx], rungs[-1])()
+        return base_idx, {base_idx: baseline}, [base_idx]
+
+    monkeypatch.setattr(model, "_successive_halving", evaluate_baseline)
+    y = np.tile([0, 1], 300)
+    X = y[:, None].astype(float)
+
+    config = model._auto_tune_clf(X, y)
+
+    assert model._linear_leaf_tune_config == config
+    assert model._linear_leaf_tune_decision is True
+    assert fits.count(False) == 2
+    assert fits.count(True) == 2
+    assert model.linear_leaf_report_[-1]["selected"] is True
+    assert model.linear_leaf_report_[-1]["loss_scenario_robust"] is True
+
+
 def test_classifier_tuning_requires_rank_gain_without_accuracy_regression(monkeypatch):
     model = TabPVN(seed=0)
     X = np.zeros((600, 3))
@@ -661,3 +704,48 @@ def test_large_linear_leaf_gate_uses_a_deterministic_stratified_audit(monkeypatc
     assert first == second
     assert len(first) == 2  # first fold rejects the affine candidate, then short-circuits
     assert {rows for _linear, rows, _sum in first} == {33_333}
+
+
+def test_memory_blend_search_covers_every_low_authority_stratum_and_legacy_anchor():
+    weights = np.asarray(base._STRATIFIED_MEMORY_BLEND_WEIGHTS)
+    anchors = np.asarray((0.1, 0.2, 0.3, 0.4, 0.5))
+    midpoints = weights[~np.isin(weights, anchors)]
+
+    np.testing.assert_allclose(np.sort(midpoints), np.arange(0.025, 0.5, 0.05))
+    assert set(anchors).issubset(weights)
+
+
+def test_target_encoding_accepts_weak_rank_gain_only_with_blockwise_proper_score_support():
+    y = np.resize(np.array([0, 1]), 256)
+    baseline = np.column_stack(
+        (np.where(y == 0, 0.55, 0.45), np.where(y == 1, 0.55, 0.45))
+    )
+    candidate = np.column_stack(
+        (np.where(y == 0, 0.65, 0.35), np.where(y == 1, 0.65, 0.35))
+    )
+
+    supported = base._target_encoding_classification_decision(
+        y,
+        np.array([0, 1]),
+        baseline,
+        candidate,
+        0.75,
+        0.752,
+    )
+    harmed = candidate.copy()
+    first_block = base.verification_blocks(len(y), y)[0]
+    harmed[first_block] = baseline[first_block, ::-1]
+    rejected = base._target_encoding_classification_decision(
+        y,
+        np.array([0, 1]),
+        baseline,
+        harmed,
+        0.75,
+        0.752,
+    )
+
+    assert supported["selected"] is True
+    assert supported["selection_path"] == "robust_proper_score_support"
+    assert min(supported["block_log_loss_gain"]) > 0.0
+    assert rejected["selected"] is False
+    assert min(rejected["block_log_loss_gain"]) < 0.0

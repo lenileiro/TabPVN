@@ -21,6 +21,15 @@ def test_tabpvn_and_hgb_are_available_without_optional_backends():
     assert isinstance(models.build("tabpvn_freq", "classification"), TabPVN)
     assert isinstance(models.build("tabpvn_no_rare_architecture", "classification"), TabPVN)
     assert isinstance(models.build("tabpvn_no_adaptive_hard_pair", "classification"), TabPVN)
+    assert isinstance(models.build("tabpvn_no_mdl_symbolic_beam", "classification"), TabPVN)
+    assert isinstance(models.build("tabpvn_no_mdl_dnf", "classification"), TabPVN)
+    assert isinstance(models.build("tabpvn_no_mdl_recursive_dnf", "classification"), TabPVN)
+    assert isinstance(models.build("tabpvn_no_mdl_exception", "classification"), TabPVN)
+    assert isinstance(models.build("tabpvn_no_bayesian_expert_router", "classification"), TabPVN)
+    assert isinstance(models.build("tabpvn_no_hierarchical_path_memory", "classification"), TabPVN)
+    assert isinstance(models.build("tabpvn_no_temporal_context_state", "classification"), TabPVN)
+    assert isinstance(models.build("tabpvn_no_temporal_suffix_tree", "classification"), TabPVN)
+    assert isinstance(models.build("tabpvn_no_categorical_hypergraph", "classification"), TabPVN)
     hgb_clf = models.build("hgb", "classification")
     hgb_reg = models.build("hgb", "regression")
     assert isinstance(hgb_clf, Pipeline)
@@ -72,8 +81,110 @@ def test_multiclass_growth_ablations_do_not_inherit_the_promoted_controller(monk
 
     best_first = models.build("tabpvn_best_first_multiclass", "classification")._auto_tune_clf(X, y)
     hard_pair = models.build("tabpvn_hard_pair_best_first", "classification")._auto_tune_clf(X, y)
+    ungated = models.build(
+        "tabpvn_ungated_adaptive_hard_pair", "classification"
+    )._with_adaptive_multiclass_pair_growth(X, y, {"depth": 6})
 
     assert best_first["best_first_pair"] is False
     assert best_first["adaptive_best_first_pair"] is False
     assert hard_pair["best_first_pair"] is True
     assert hard_pair["adaptive_best_first_pair"] is False
+    assert ungated["adaptive_best_first_pair"] is True
+    assert ungated["verifier_gated_pair_growth"] is False
+
+
+def test_mdl_symbolic_beam_ablation_disables_only_beam_expansion():
+    default = models.build("tabpvn", "classification")
+    ablation = models.build("tabpvn_no_mdl_symbolic_beam", "classification")
+
+    assert default._symbolic_mdl_beam is True
+    assert ablation._symbolic_mdl_beam is False
+    assert default._new_symbolic_predicate_map(seed=0).mdl_beam is True
+    assert ablation._new_symbolic_predicate_map(seed=0).mdl_beam is False
+    assert ablation._new_symbolic_predicate_map(seed=0).mdl_dnf is False
+    assert ablation._new_symbolic_predicate_map(seed=0).mdl_recursive_dnf is False
+    assert ablation._new_symbolic_predicate_map(seed=0).mdl_exception is False
+
+
+def test_mdl_exception_ablation_retains_recursive_dnf_search():
+    default = models.build("tabpvn", "classification")
+    ablation = models.build("tabpvn_no_mdl_exception", "classification")
+
+    assert default._symbolic_mdl_recursive_dnf is ablation._symbolic_mdl_recursive_dnf is True
+    assert default._symbolic_mdl_exception is True
+    assert ablation._symbolic_mdl_exception is False
+    assert default._new_symbolic_predicate_map(seed=0).mdl_exception is True
+    assert ablation._new_symbolic_predicate_map(seed=0).mdl_recursive_dnf is True
+    assert ablation._new_symbolic_predicate_map(seed=0).mdl_exception is False
+
+
+def test_mdl_dnf_ablation_retains_signed_conjunction_search():
+    default = models.build("tabpvn", "classification")
+    ablation = models.build("tabpvn_no_mdl_dnf", "classification")
+
+    assert default._symbolic_mdl_beam is ablation._symbolic_mdl_beam is True
+    assert default._symbolic_mdl_dnf is True
+    assert ablation._symbolic_mdl_dnf is False
+    assert default._new_symbolic_predicate_map(seed=0).mdl_dnf is True
+    assert ablation._new_symbolic_predicate_map(seed=0).mdl_dnf is False
+    assert ablation._new_symbolic_predicate_map(seed=0).mdl_recursive_dnf is False
+    assert ablation._new_symbolic_predicate_map(seed=0).mdl_exception is True
+
+
+def test_recursive_dnf_ablation_retains_pair_composition():
+    default = models.build("tabpvn", "classification")
+    ablation = models.build("tabpvn_no_mdl_recursive_dnf", "classification")
+
+    assert default._symbolic_mdl_dnf is ablation._symbolic_mdl_dnf is True
+    assert default._symbolic_mdl_recursive_dnf is True
+    assert ablation._symbolic_mdl_recursive_dnf is False
+    assert default._new_symbolic_predicate_map(seed=0).mdl_recursive_dnf is True
+    assert ablation._new_symbolic_predicate_map(seed=0).mdl_dnf is True
+    assert ablation._new_symbolic_predicate_map(seed=0).mdl_recursive_dnf is False
+    assert ablation._new_symbolic_predicate_map(seed=0).mdl_exception is True
+
+
+def test_bayesian_expert_router_ablation_retains_global_memory_blends():
+    default = models.build("tabpvn", "classification")
+    ablation = models.build("tabpvn_no_bayesian_expert_router", "classification")
+
+    assert default._bayesian_expert_routing is True
+    assert ablation._bayesian_expert_routing is False
+    assert default._categorical_evidence is ablation._categorical_evidence is True
+    assert default._proof_path_evidence is ablation._proof_path_evidence is True
+
+
+def test_hierarchical_path_ablation_retains_the_local_certified_path_read():
+    default = models.build("tabpvn", "classification")
+    ablation = models.build("tabpvn_no_hierarchical_path_memory", "classification")
+
+    assert default._hierarchical_proof_path_memory is True
+    assert ablation._hierarchical_proof_path_memory is False
+    assert default._proof_path_evidence is ablation._proof_path_evidence is True
+
+
+def test_temporal_context_ablation_retains_causal_laplace_history():
+    default = models.build("tabpvn", "classification")
+    ablation = models.build("tabpvn_no_temporal_context_state", "classification")
+
+    assert default._temporal_context_state is True
+    assert ablation._temporal_context_state is False
+
+
+def test_temporal_suffix_tree_ablation_retains_fixed_context_state():
+    default = models.build("tabpvn", "classification")
+    ablation = models.build("tabpvn_no_temporal_suffix_tree", "classification")
+
+    assert default._temporal_context_tree is True
+    assert ablation._temporal_context_tree is False
+    assert default._temporal_context_state is ablation._temporal_context_state is True
+
+
+def test_categorical_hypergraph_ablation_retains_pair_posteriors():
+    default = models.build("tabpvn", "classification")
+    ablation = models.build("tabpvn_no_categorical_hypergraph", "classification")
+
+    assert default._categorical_hypergraph_posterior is True
+    assert ablation._categorical_hypergraph_posterior is False
+    assert default._categorical_posterior_evidence is True
+    assert ablation._categorical_posterior_evidence is True

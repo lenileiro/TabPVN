@@ -37,6 +37,36 @@ def _stream(seed=31, entities=24, events_per_entity=42):
     return frame, np.asarray(labels), np.asarray(regression)
 
 
+def _third_order_regime_stream(seed=13, entities=20, steps=60):
+    rng = np.random.default_rng(seed)
+    mapping = rng.integers(0, 2, 27)
+    states = np.empty((entities, steps), dtype=np.int8)
+    target = np.zeros((entities, steps), dtype=np.int8)
+    states[:, :3] = rng.integers(0, 3, size=(entities, 3))
+    target[:, :3] = rng.integers(0, 2, size=(entities, 3))
+    for step in range(3, steps):
+        context = states[:, step - 1] * 9 + states[:, step - 2] * 3 + states[:, step - 3]
+        regime = mapping[context]
+        target[:, step] = regime
+        follows_regime = rng.random(entities) < 0.68
+        states[:, step] = np.where(
+            follows_regime,
+            np.where(regime == 1, 2, 0),
+            np.where(regime == 1, 0, 2),
+        )
+    values = np.array([-1.0, 0.0, 1.0])
+    rows = [
+        (
+            entity,
+            pd.Timestamp("2025-01-01", tz="UTC") + pd.Timedelta(hours=step),
+            values[states[entity, step]],
+        )
+        for entity in range(entities)
+        for step in range(steps)
+    ]
+    return pd.DataFrame(rows, columns=["entity", "time", "mark"]), target.reshape(-1)
+
+
 def test_future_gate_selects_temporal_evidence_for_classification_and_regression():
     events, labels, regression = _stream()
     features = events.drop(columns="step")
@@ -70,6 +100,15 @@ def test_future_gate_selects_temporal_evidence_for_classification_and_regression
     assert continuous["relative_gain"] > 0.1
     assert continuous["confidence_lower_relative_gain"] > 0.0
     assert classification["features"] <= 32
+    assert classification["context_state_considered"] is True
+    assert classification["selected_representation"] == "laplace"
+    assert classification["context_state_selected"] is False
+    assert classification["context_state_features"] == 0
+    assert classification["context_state_comparison"]["reason"] == "context_incremental_gate_rejected"
+    assert continuous["selected_representation"] == "laplace_context"
+    assert continuous["context_state_selected"] is True
+    assert continuous["context_state_features"] == 5
+    assert continuous["context_state_comparison"]["reason"] is None
 
 
 def test_future_gate_rejects_history_when_current_row_already_determines_target():
@@ -97,6 +136,29 @@ def test_future_gate_rejects_history_when_current_row_already_determines_target(
     assert report["selected"] is False
     assert report["reason"] == "future_holdout_gain_below_gate"
     assert report["candidate_score"] < report["baseline_score"] + report["minimum_gain"]
+
+
+def test_future_gate_selects_suffix_tree_only_after_an_incremental_forward_win():
+    events, target = _third_order_regime_stream()
+
+    report = TemporalEvidenceChallenger(seed=7).evaluate(
+        events,
+        target,
+        entity="entity",
+        timestamp="time",
+        value_columns=["mark"],
+        task="classification",
+    )
+
+    comparison = report["context_tree_comparison"]
+    assert report["selected"] is True
+    assert report["selected_representation"] == "laplace_context_tree"
+    assert report["context_tree_selected"] is True
+    assert report["context_tree_features"] == 4
+    assert comparison["incumbent_representation"] == "laplace_context"
+    assert comparison["incremental_gain"] > comparison["minimum_incremental_gain"]
+    assert comparison["forward_stable"] is True
+    assert all(gain > 0.0 for gain in comparison["forward_window_incremental_gains"])
 
 
 def test_gate_cap_samples_complete_histories_across_many_entities():
@@ -229,8 +291,11 @@ def test_event_aware_fit_deploys_selected_map_and_predicts_from_original_schema(
     assert model.validation_report_["threshold_validation_rows"] > 0
     assert model._fit_validation is None
     assert model.temporal_evidence_report_[0]["deployed_features"] <= 32
+    assert model.temporal_evidence_report_[0]["context_state_selected"] is False
+    assert model.temporal_evidence_report_[0]["deployed_context_state"]["enabled"] is False
     assert "entity" not in model._prep.input_cols
     assert any("history_laplace" in str(column) for column in model._prep.input_cols)
+    assert not any("history_context" in str(column) for column in model._prep.input_cols)
     assert tuple(model.feature_names_in_) == tuple(train_events.columns)
     assert probability.shape == (len(future_events), 2)
     assert model.certify(future_events.iloc[:20]) == 1.0
@@ -240,6 +305,27 @@ def test_event_aware_fit_deploys_selected_map_and_predicts_from_original_schema(
     assert sorted_times[fit_rows].max() < sorted_times[verifier].min()
     restored = pickle.loads(pickle.dumps(model, protocol=pickle.HIGHEST_PROTOCOL))
     np.testing.assert_array_equal(restored.predict_proba(future_events), probability)
+
+
+def test_event_aware_fit_deploys_only_incrementally_selected_context_state():
+    events, _, regression = _stream()
+    features = events.drop(columns="step")
+    model = TabPVN(
+        seed=7,
+        boost={"rounds": 20, "depth": 3, "leaf": 6, "patience": 6, "refit": False},
+    ).fit(
+        features,
+        regression,
+        entity="entity",
+        timestamp="time",
+        value_columns=["amount"],
+    )
+
+    report = model.temporal_evidence_report_[0]
+    assert report["selected_representation"] == "laplace_context"
+    assert report["context_state_selected"] is True
+    assert report["deployed_context_state"]["enabled"] is True
+    assert any("history_context" in str(column) for column in model._prep.input_cols)
 
 
 def test_fit_automatically_discovers_and_selects_event_semantics():

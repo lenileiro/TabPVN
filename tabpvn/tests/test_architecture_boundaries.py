@@ -32,6 +32,14 @@ def test_fit_pipeline_records_stages_and_proposer_registry():
     stages = [stage["name"] for stage in model.fit_stages_]
     assert stages == ["schema", "candidate_gates", "certified_predictor", "confidence", "reports"]
     assert "symbolic_predicate_boost" in model.proposer_registry_
+    assert "mdl_symbolic_beam" in model.proposer_registry_
+    assert "mdl_recursive_dnf" in model.proposer_registry_
+    assert "mdl_exception_program" in model.proposer_registry_
+    assert "bayesian_expert_router" in model.proposer_registry_
+    assert "hierarchical_proof_path_memory" in model.proposer_registry_
+    assert "temporal_context_state" in model.proposer_registry_
+    assert "temporal_suffix_tree" in model.proposer_registry_
+    assert "categorical_hypergraph_posterior" in model.proposer_registry_
     assert model.fit_pipeline_["proposers"] == default_registry().describe()
 
 
@@ -39,11 +47,13 @@ def test_default_proposer_registry_names_are_unique_and_ordered():
     names = default_registry().names()
 
     assert len(names) == len(set(names))
-    assert names[:6] == (
+    assert names[:8] == (
         "automatic_event_schema",
         "target_encoding",
         "compression_evidence",
         "temporal_laplace_evidence",
+        "temporal_context_state",
+        "temporal_suffix_tree",
         "auto_boost",
         "shallow_certified_boost",
     )
@@ -51,11 +61,15 @@ def test_default_proposer_registry_names_are_unique_and_ordered():
     assert "rare_symbolic_predicate_boost" in names
     assert "multiclass_rank_checkpoint" in names
     assert "multiclass_residual_stump_head" in names
+    assert "stratified_scenario_verifier" in names
     assert "multiclass_residual_predicate_boost" in names
-    assert names[-5:] == (
+    assert names[-8:] == (
         "smooth_knn",
+        "hierarchical_proof_path_memory",
+        "bayesian_expert_router",
         "global_affine_rank",
         "categorical_posterior",
+        "categorical_hypergraph_posterior",
         "numeric_interval_decision",
         "sdm_attention",
     )
